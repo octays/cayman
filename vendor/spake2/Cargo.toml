@@ -1,0 +1,22 @@
+[package]
+name = "spake2"
+version = "0.4.0"
+edition = "2021"
+authors = ["Brian Warner <warner@lothar.com>"]
+license = "MIT OR Apache-2.0"
+description = "Vendored RustCrypto SPAKE2 0.4.0 (see VENDOR.md for local adaptations)"
+
+[dependencies]
+curve25519-dalek = { version = "4", default-features = false, features = ["rand_core"] }
+rand_core = { version = "0.6", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+hkdf = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+hex = "0.4"
+num-bigint = "0.4"
+
+[features]
+default = ["getrandom"]
+getrandom = ["rand_core/getrandom"]
+std = []

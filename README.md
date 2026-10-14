@@ -1,0 +1,121 @@
+# Cayman
+
+Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接，使用 SPAKE2 短码配对和端到端 TLS。发送端只选择源目录，接收端决定目标目录；不提供 local-sync。
+
+命令支持短别名：`s` 等同于 `send`，`r` 等同于 `receive`。例如 `cayman s ./docs --once`、`cayman r .`。
+
+## 默认通过中继同步
+
+发送端：
+
+```bash
+cargo run -- send ./docs
+```
+
+源路径末尾决定接收端的目录布局（假设接收端运行 `cayman receive ./received`）：
+
+| 发送命令 | 接收位置 |
+| --- | --- |
+| `cayman send docs` | `received/docs/`，包含 docs 目录本身 |
+| `cayman send docs/` | `received/`，仅放入 docs 内的内容 |
+| `cayman send docs/.` | 同 `docs/` |
+| `cayman send .` | 将当前目录的内容放入 `received/` |
+
+空目录也会同步；中继和直连模式规则一致。旧版本始终发送目录内容，升级后若需保持原布局，请给源目录加 `/`。`sync` 子命令已移除，使用 `cargo run -- send docs`。
+
+发送端会显示类似 `Pairing code: 482731-maple-river-otter-cloud` 的短码。
+
+接收端：
+
+```bash
+cargo run -- receive ./received-docs
+# 按提示粘贴发送端显示的完整配对码
+```
+
+两端默认连接 `croc.schollz.com:9009`，使用其默认接入密码 `pass123`。双方都只发起出站 TCP 连接，无需配置发送端公网 IP 或监听端口。公共节点在当前环境尚未实测，服务可用性取决于该节点及本地网络。
+
+使用其他现有 Go croc relay 时，两端指定同一个地址：
+
+```bash
+cargo run -- send ./docs --relay relay.example.com:9009
+cargo run -- receive ./received-docs --relay relay.example.com:9009
+```
+
+私有中继密码通过 `--relay-password-file /path/to/password` 读取；它与端到端配对码相互独立。无需另写 Cayman relay 服务端。Rust 接入层按 [croc v11.5.3](https://github.com/schollz/croc/tree/v11.5.3) 的传统接入协议实现，不要求用户安装 Go 或 croc 客户端。实际 Go 中继互操作测试仍待在允许联网和监听端口的环境运行，详见 [适配说明](docs/relay-implementation.md)。
+
+默认持续同步，每轮结束后等待 1 秒再扫描。接收端会显示中继连接、配对、目标目录、单行刷新的同步百分比及每轮同步结果；首次同步后提示等待源目录变化。两端均不重复打印无变化的轮询结果。发送端添加 `--once` 只同步一轮，随后发送端和接收端退出，不再监听变化。单轮传输仍会比对和复用已有文件块，此开关不表示强制全量覆盖。无需 `--state-dir`；接收端自动在目标目录内维护 `.cayman` 状态。
+
+只传输一次：
+
+```bash
+cayman send ./docs --once
+cayman receive ./received-docs
+```
+
+接收端无需额外参数，自动跟随发送端结束本轮会话。
+
+## 显式选择直连
+
+只有提供以下参数才使用直连，不会在中继失败后自动切换：
+
+```bash
+# 发送端
+cargo run -- send ./docs --listen 0.0.0.0:9009
+# 接收端：换成可达的发送端 IP
+cargo run -- receive ./received-docs --connect 192.168.1.10:9009
+```
+
+`--listen` / `--connect` 与中继配置互斥。直连需要发送端 TCP 端口可达。
+
+## 配对与加密
+
+通过可信渠道交给接收方完整短码，也可使用发送端 `--code-file /path/outside/source/invite` 写入新文件，再由接收端 `--code-file /path/to/invite` 读取。不会覆盖已有邀请码文件，Unix 下以 0600 权限创建；请勿放入共享目录。
+
+短码由 **6 位公开房间号 + 4 个随机单词**组成。每个单词从固定的 256 词词表均匀选择，秘密部分共 32 位随机熵；房间号不计入秘密熵。中继只收到房间号派生的路由名称，不收到单词或整个短码的哈希。
+
+双方执行 SPAKE2 并双向确认密钥，绑定协议版本、房间号和发送/接收角色。确认成功后，通过认证加密交换本次 TLS 的证书指纹与随机认证秘密，再建立固定证书的 TLS 1.3 通道。文件内容和元数据仍通过 TLS 传输；未完成认证不会访问接收目录。具体流程见 [短码配对协议](docs/short-code-pairing.md)。
+
+每次启动生成新码，最多等待另一端 10 分钟（中继可能更早清理房间），配对握手限时 30 秒。一次启动只允许一次配对尝试；错误短码或连接中断会结束本次会话，重新运行发送端获取新码。短码不支持自选弱密码。接收时允许单词大小写和整行首尾空白。
+
+**两端都需要升级。** 原先 `cayman-direct-v1:...` 长码不再作为用户输入；旧实例需重启生成短码。短码与 croc 体验类似，但两端仍须运行 Cayman，不能与官方 croc 客户端互传。自动重连和直连 NAT 穿透尚未实现。
+
+## 增量与可靠性
+
+- 按 256 KiB 固定块进行 SHA-256 比对，只请求缺失块；复用同名目标文件中的相同块，完成后再次验证整个文件。
+- 临时文件写入、同步后原子替换，保存提交意图与共同基线。进程重启会检查待完成提交；已完成文件可跳过，未完成文件需要重新比对。
+- 首次遇到已有且内容不同的文件默认报告冲突。接收端显式指定 `--replace-existing` 才允许接管此类文件；有共同基线后，接收端自行修改或删除的文件仍受到冲突保护。
+- 覆盖已有文件前，在 `.cayman` 内保留旧内容与备份信息。单轮遇到冲突返回失败；持续模式保留冲突文件并继续下一轮。
+- 接收目录独占锁、路径校验、符号链接拒绝、帧长度上限与超时。`.cayman` 是保留目录，不能作为业务文件名。
+
+当前实现是全目录轮询的单向同步：不传播删除，不保留权限、时间戳等元数据，不实现双向合并、原生文件事件监控或持久化块级断点续传。新文件使用临时文件的私有权限。目标目录应由可信本机用户管理；当前路径检查不能防御恶意本机进程并发替换目录。
+
+接收端目前支持 Unix（macOS/Linux）。原型限制：每轮最多 10,000 个条目、单文件最多 1 GiB，接收端 `--max-bytes` 默认为每轮声明文件总大小 10 GiB。这不是累计磁盘配额；历史备份尚无自动清理策略。JSON 数据帧存在编码开销，尚未实现二进制块编码、CDC、压缩、索引缓存和并行传输。源文件在传输中变化时可能终止本次会话；断线后需重启发送端并使用新码连接。
+
+## 只读比较
+
+```bash
+cargo run -- compare ./source ./target
+cargo run -- compare ./source ./target --chunk-size 262144 --json
+```
+
+这是开发用的只读比较命令，两个路径均须存在，不写入或同步文件。它报告内容差异与固定块复用估算；差异本身不导致失败。正常远程同步请使用上面的两个角色命令。
+
+## 验证
+
+```bash
+cargo fmt --check
+cargo clippy --offline --all-targets -- -D warnings
+cargo test --offline
+# vendored SPAKE2 的上游向量及文档测试：
+cargo test --offline --manifest-path vendor/spake2/Cargo.toml --features std
+# 在允许监听回环 TCP 端口的终端另行运行：
+cargo test --offline --test remote_cli -- --ignored
+```
+
+默认测试包含短码生成/解析、SPAKE2 错码和房间绑定、握手篡改拒绝、Go 独立算术参考向量、模拟中继接入/心跳/拒绝响应，以及内存双工流上的真实 TLS 握手、证书固定、秘密认证、远程传输、持续增量更新、冲突保护与状态恢复。三个真实 TCP 测试需要显式运行，其中 Go 中继测试需 PATH 中有 croc v11.5.3；当前开发沙箱禁止监听端口，尚未在此环境通过这些测试。内存测试不能替代跨机器实测。
+
+`--offline` 需要依赖缓存；首次联网构建可去掉它。SPAKE2 0.4.0 源码已随项目纳入，来源及适配记录见 [VENDOR.md](vendor/spake2/VENDOR.md)。HKDF/HMAC/AES-GCM 记录模块现在用于 SPAKE2 密钥确认和 TLS 凭据的认证加密；文件数据通道仍使用 rustls TLS。
+
+后续路线与设计：[基础实施方案](docs/implementation-plan.md)、[性能与同步](docs/performance-reliability-sync.md)、[p2sync 评估](docs/p2sync-review.md)。
+
+终端进度每秒最多刷新 10 次：总体百分比按本轮已处理条目数计算（含目录和未变化文件），当前文件百分比按需传输的字节数计算，不包含复用块。首次同步显示 Initial sync，后续变化显示 Incremental sync；无变化轮询保持安静。输出重定向时仅保留汇总，不写入进度控制字符。
