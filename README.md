@@ -4,6 +4,49 @@ Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接
 
 命令支持短别名：`s` 等同于 `send`，`r` 等同于 `receive`。例如 `cayman s ./docs`、`cayman r .`。
 
+## 安装最新 Release
+
+支持 Linux / macOS 的 amd64 和 arm64。Linux 使用静态 musl 二进制，也适用于 Alpine 和 WSL；其他系统或架构会明确报错。默认安装到 `~/.local/bin`，无需 sudo：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/install.sh | bash
+```
+
+也可以先下载脚本再执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/install.sh -o install-cayman.sh
+bash install-cayman.sh
+```
+
+自定义安装位置（需拥有目录写权限）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/install.sh | CAYMAN_INSTALL_DIR=/usr/local/bin bash
+```
+
+脚本自动识别系统和架构，从 `octays/cayman` 的最新正式 Release 下载对应二进制，校验 SHA-256，验证程序可运行后原子替换。下载或校验失败会保留已有安装。依赖 Bash 3.2+、curl 和 sha256sum 或 shasum。不修改 shell 配置，必要时会提示添加 PATH。仓库需先发布至少一个正式 Release。
+
+## 构建与发布
+
+[Release 工作流](.github/workflows/release.yml) 在推送 `v*` 标签时构建四种独立二进制文件：
+
+- `cayman-linux-amd64`
+- `cayman-linux-arm64`
+- `cayman-darwin-amd64`
+- `cayman-darwin-arm64`
+
+每个二进制附带 `.sha256` 文件。Linux 必须通过 UPX 压缩、完整性检测和运行检查；macOS 尝试 UPX，格式不支持或运行检查失败时保留原二进制。构建日志记录最终压缩方式；依赖的许可证和来源说明作为独立附件保留。所有平台构建成功后创建并发布 GitHub Release；带连字符的版本标签（如 `v0.2.0-rc.1`）标记为预发布，安装脚本不会选择它。手动运行工作流可下载构建产物，只有标签运行会发布 Release。
+
+发布前更新 `Cargo.toml` 的版本并更新锁文件，然后提交并推送标签，例如：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流使用 GitHub 托管的原生架构 runner，参考 [GitHub runner 文档](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)；压缩工具参考 [UPX 官方文档](https://github.com/upx/upx/blob/devel/doc/upx-doc.txt)。当前不提供 Windows 原生二进制，因为接收端尚未支持 Windows。
+
 ## 默认通过中继同步
 
 发送端：
@@ -50,7 +93,7 @@ cayman send ./docs
 cayman receive ./received
 ```
 
-发送端添加 `--watch` 开启持续增量同步，每轮结束后等待 1 秒再扫描：
+发送端添加 `--watch` 开启持续增量同步，每秒检查目录元数据，发现变化后执行增量同步：
 
 ```bash
 cayman send ./docs --watch
@@ -92,7 +135,22 @@ cargo run -- receive ./received-docs --connect 192.168.1.10:9009
 - 覆盖已有文件前，在 `.cayman` 内保留旧内容与备份信息。单轮遇到冲突返回失败；持续模式保留冲突文件并继续下一轮。
 - 接收目录独占锁、路径校验、符号链接拒绝、帧长度上限与超时。`.cayman` 是保留目录，不能作为业务文件名。
 
-当前实现是全目录轮询的单向同步：不传播删除，不保留权限、时间戳等元数据，不实现双向合并、原生文件事件监控或持久化块级断点续传。新文件使用临时文件的私有权限。目标目录应由可信本机用户管理；当前路径检查不能防御恶意本机进程并发替换目录。
+同步汇总将文件结果与数据量分开，例如：
+
+```text
+Files: 1 updated, 4 unchanged | Conflicts: 0
+File data: 27875 bytes transferred, 0 bytes reused locally
+```
+
+`updated` 包含新增或替换且已成功提交的文件，`unchanged` 表示内容相同的文件；目录不计入这两个文件计数，冲突计数可能包含目录。数据量统计已成功提交文件的原始内容字节，不是网卡流量，不包含元数据、JSON 编码、TLS 开销或未提交传输。`reused locally` 只统计更新文件时复用的本地块，不包含整个跳过的未变化文件。
+
+比对发生在发送文件内容之前：发送端在本地读取源文件，先发送路径、大小和整文件 SHA-256，只有接收端需要更新时再发送每个 256 KiB 块的 SHA-256；接收端在本地计算已有文件摘要，相同则跳过，不同且允许更新时请求缺失块。本地匹配块可在同一个目标文件的其他块位置复用。接收端重建临时文件，校验整文件后原子提交。
+
+摘要采用有容量上限的会话内缓存，以大小、修改时间以及 Unix 设备号、inode、ctime 判断是否可复用。`--watch` 每秒轮询目录元数据；源端无变化时只交换心跳，不重复发送文件清单或读取内容。每 60 秒清空两端缓存并执行完整校验，补偿元数据检测遗漏并检查接收端变化。源端变化时仍发送一轮完整的轻量文件摘要，批量清单和原生文件系统事件监听尚未实现。首次遇到相同文件无需传输块摘要或文件内容。缓存不跨进程持久化；最终提交前仍重新读取并核对目标，避免缓存削弱本地修改冲突保护。
+
+摘要目前仍使用 JSON 编码并逐文件交互。小于 256 KiB 的文件只有一个块，改动一个字节也要重传整个文件内容；大文件中部插入数据可能使后续固定块边界错位。此次文件同步握手已升级为 `cayman-sync/2`，两端需同时更新，旧版本会拒绝连接。
+
+当前实现是目录元数据轮询的单向同步：不传播删除，不保留权限、时间戳等元数据，不实现双向合并、原生文件事件监控或持久化块级断点续传。新文件使用临时文件的私有权限。目标目录应由可信本机用户管理；当前路径检查不能防御恶意本机进程并发替换目录。
 
 接收端目前支持 Unix（macOS/Linux）。原型限制：每轮最多 10,000 个条目、单文件最多 1 GiB，接收端 `--max-bytes` 默认为每轮声明文件总大小 10 GiB。这不是累计磁盘配额；历史备份尚无自动清理策略。JSON 数据帧存在编码开销，尚未实现二进制块编码、CDC、压缩、索引缓存和并行传输。源文件在传输中变化时可能终止本次会话；断线后需重启发送端并使用新码连接。
 

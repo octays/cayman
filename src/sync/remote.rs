@@ -1,5 +1,5 @@
 //! Relay/default and explicit direct TLS synchronization; writes are receiver-owned.
-use super::compare::{Kind, inventory, manifest};
+use super::compare::{Kind, inventory, same_version};
 use crate::{
     crypto::{
         direct::{self, Error, Invitation},
@@ -10,12 +10,12 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Read, Seek, SeekFrom},
     net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -62,6 +62,11 @@ pub struct Report {
 pub(super) enum Message {
     Begin { count: usize },
     Offer(Offer),
+    NeedBlocks,
+    Blocks { hashes: Vec<[u8; 32]> },
+    Recheck,
+    Ping,
+    Pong,
     Need { indices: Vec<usize> },
     Skip,
     Conflict,
@@ -226,7 +231,7 @@ async fn accept_stream<S: AsyncRead + AsyncWrite + Unpin>(
         {
             return Err::<(), Error>("receiver authentication failed".into());
         }
-        io.send(b"cayman-direct/1 ready").await?;
+        io.send(b"cayman-sync/2 ready").await?;
         Ok(())
     })
     .await??;
@@ -264,7 +269,7 @@ async fn receive_stream<S: AsyncRead + AsyncWrite + Unpin>(
     .await??;
     let mut io = Framed::new(tls, MAX_RECORD, IO_TIMEOUT)?;
     io.send(invitation.secret.as_ref()).await?;
-    if io.receive().await? != b"cayman-direct/1 ready" {
+    if io.receive().await? != b"cayman-sync/2 ready" {
         return Err("sender authentication protocol mismatch".into());
     }
     let mut storage = super::receiver::Storage::open(output, replace_existing)?;
@@ -286,12 +291,14 @@ impl RoundLog {
     fn report(&mut self, report: &Report) {
         if !self.started || report.installed > 0 || self.conflicts != report.conflicts {
             eprintln!(
-                "Installed {}, unchanged {}, transferred {} bytes, reused {} bytes, conflicts {}",
+                "Files: {} updated, {} unchanged | Conflicts: {}",
                 report.installed,
                 report.unchanged,
-                report.transferred_bytes,
-                report.reused_bytes,
                 report.conflicts.len()
+            );
+            eprintln!(
+                "File data: {} bytes transferred, {} bytes reused locally",
+                report.transferred_bytes, report.reused_bytes
             );
             for path in &report.conflicts {
                 eprintln!("Conflict preserved: {path:?}");
@@ -310,7 +317,10 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), Error> {
     let (source, prefix) = source_layout(source)?;
     let mut log = RoundLog::default();
+    let mut cache = super::cache::ManifestCache::default();
+    let mut rechecked = Instant::now();
     loop {
+        let snapshot = source_snapshot(&source)?;
         let mut entries: Vec<_> = inventory(&source)?
             .into_iter()
             .filter(|(p, _)| !p.starts_with(".cayman"))
@@ -355,7 +365,7 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
                 if std::fs::symlink_metadata(&full)?.len() > MAX_FILE {
                     return Err("file exceeds 1 GiB direct-prototype limit".into());
                 }
-                let m = manifest(&full, CHUNK)?;
+                let m = cache.get(&full, CHUNK)?;
                 Offer {
                     path,
                     directory,
@@ -363,7 +373,7 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
                         hash: m.hash,
                         size: m.size,
                     },
-                    blocks: m.blocks.into_iter().map(|b| b.hash).collect(),
+                    blocks: m.blocks.iter().map(|b| b.hash).collect(),
                 }
             };
             write(
@@ -372,11 +382,22 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
                     path: offer.path.clone(),
                     directory,
                     version: offer.version.clone(),
-                    blocks: offer.blocks.clone(),
+                    blocks: Vec::new(),
                 }),
             )
             .await?;
-            match read(io).await? {
+            let mut response = read(io).await?;
+            if matches!(response, Message::NeedBlocks) && !directory {
+                write(
+                    io,
+                    &Message::Blocks {
+                        hashes: offer.blocks.clone(),
+                    },
+                )
+                .await?;
+                response = read(io).await?;
+            }
+            match response {
                 Message::Skip | Message::Conflict => continue,
                 Message::Need { indices } if !directory => {
                     if indices.len() > offer.blocks.len() {
@@ -425,8 +446,52 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
             }
             return Ok(());
         }
-        tokio::time::sleep(interval).await;
+        loop {
+            tokio::time::sleep(interval).await;
+            if rechecked.elapsed() >= super::cache::RECHECK {
+                cache.clear();
+                write(io, &Message::Recheck).await?;
+                rechecked = Instant::now();
+                break;
+            }
+            if !same_snapshot(&snapshot, &source_snapshot(&source)?) {
+                break;
+            }
+            write(io, &Message::Ping).await?;
+            if !matches!(read(io).await?, Message::Pong) {
+                return Err("expected heartbeat response".into());
+            }
+        }
     }
+}
+
+fn source_snapshot(root: &Path) -> Result<BTreeMap<PathBuf, std::fs::Metadata>, Error> {
+    let entries = inventory(root)?;
+    if entries.len() > MAX_FILES {
+        return Err("too many source entries".into());
+    }
+    entries
+        .into_keys()
+        .filter(|p| !p.starts_with(".cayman"))
+        .map(|relative| {
+            Ok((
+                relative.clone(),
+                std::fs::symlink_metadata(root.join(relative))?,
+            ))
+        })
+        .collect()
+}
+
+fn same_snapshot(
+    a: &BTreeMap<PathBuf, std::fs::Metadata>,
+    b: &BTreeMap<PathBuf, std::fs::Metadata>,
+) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|(path, meta)| {
+            b.get(path).is_some_and(|other| {
+                meta.file_type() == other.file_type() && same_version(meta, other)
+            })
+        })
 }
 
 pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
@@ -436,7 +501,16 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), Error> {
     let mut log = RoundLog::default();
     loop {
-        let Message::Begin { count } = read(io).await? else {
+        let message = read(io).await?;
+        if matches!(message, Message::Recheck) {
+            storage.clear_cache();
+            continue;
+        }
+        if matches!(message, Message::Ping) {
+            write(io, &Message::Pong).await?;
+            continue;
+        }
+        let Message::Begin { count } = message else {
             return Err("expected round begin".into());
         };
         if count > MAX_FILES {
@@ -450,7 +524,7 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
             let Message::Offer(offer) = read(io).await? else {
                 return Err("expected file offer".into());
             };
-            super::receiver::validate_offer(&offer)?;
+            super::receiver::validate_summary(&offer)?;
             if !seen.insert(offer.path.clone()) {
                 return Err("duplicate offer path".into());
             }
@@ -494,6 +568,79 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn unchanged_files_send_only_summary_not_block_lists() {
+        let source = tempdir().unwrap();
+        let contents = source.path().join(".");
+        std::fs::write(source.path().join("file"), vec![7; CHUNK * 4]).unwrap();
+        let (a, b) = tokio::io::duplex(4096);
+        let mut a = Framed::new(a, MAX_RECORD, Duration::from_secs(3)).unwrap();
+        let mut b = Framed::new(b, MAX_RECORD, Duration::from_secs(3)).unwrap();
+        let peer = async {
+            assert!(matches!(
+                read(&mut b).await.unwrap(),
+                Message::Begin { count: 1 }
+            ));
+            let Message::Offer(offer) = read(&mut b).await.unwrap() else {
+                panic!("summary expected")
+            };
+            assert!(offer.blocks.is_empty());
+            assert_eq!(offer.version.size, (CHUNK * 4) as u64);
+            write(&mut b, &Message::Skip).await.unwrap();
+            assert!(matches!(
+                read(&mut b).await.unwrap(),
+                Message::End { done: true }
+            ));
+            write(
+                &mut b,
+                &Message::Report(Report {
+                    unchanged: 1,
+                    ..Report::default()
+                }),
+            )
+            .await
+            .unwrap();
+        };
+        let (sent, ()) = tokio::join!(
+            sender_session(&contents, &mut a, true, Duration::ZERO),
+            peer
+        );
+        sent.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_requested_block_list_cannot_install_file() {
+        let output = tempdir().unwrap();
+        let mut storage = super::super::receiver::Storage::open(output.path(), false).unwrap();
+        let (a, b) = tokio::io::duplex(4096);
+        let mut a = Framed::new(a, MAX_RECORD, Duration::from_secs(3)).unwrap();
+        let mut b = Framed::new(b, MAX_RECORD, Duration::from_secs(3)).unwrap();
+        let peer = async {
+            write(&mut a, &Message::Begin { count: 1 }).await.unwrap();
+            write(
+                &mut a,
+                &Message::Offer(Offer {
+                    path: "file".into(),
+                    directory: false,
+                    version: Version {
+                        size: 1,
+                        hash: [1; 32],
+                    },
+                    blocks: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(read(&mut a).await.unwrap(), Message::NeedBlocks));
+            write(&mut a, &Message::Blocks { hashes: Vec::new() })
+                .await
+                .unwrap();
+        };
+        let ((), received) = tokio::join!(peer, receiver_session(&mut storage, &mut b, MAX_FILE));
+        assert!(received.is_err());
+        assert!(!output.path().join("file").exists());
+    }
 
     #[tokio::test]
     async fn directory_spelling_controls_layout_and_incremental_updates() {
@@ -697,6 +844,11 @@ mod tests {
                     assert_eq!(report.reused_bytes, (2 * CHUNK) as u64);
                 }
                 write(&mut io, &Message::Report(report)).await.unwrap();
+                if round == 0 {
+                    // An idle source sends only a heartbeat, not another file offer.
+                    assert!(matches!(read(&mut io).await.unwrap(), Message::Ping));
+                    write(&mut io, &Message::Pong).await.unwrap();
+                }
                 data[CHUNK + 9] ^= 1;
                 std::fs::write(source.path().join("file"), &data).unwrap();
             }

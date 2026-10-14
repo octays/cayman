@@ -128,7 +128,7 @@ pub(super) struct Manifest {
     pub(super) size: u64,
 }
 
-fn same_version(a: &Metadata, b: &Metadata) -> bool {
+pub(super) fn same_version(a: &Metadata, b: &Metadata) -> bool {
     let basic = a.len() == b.len() && a.modified().ok() == b.modified().ok();
     #[cfg(unix)]
     {

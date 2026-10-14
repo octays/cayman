@@ -53,6 +53,17 @@ pub(super) fn validate_offer(offer: &Offer) -> Result<(), Error> {
     Ok(())
 }
 
+pub(super) fn validate_summary(offer: &Offer) -> Result<(), Error> {
+    validate_path(&offer.path)?;
+    if !offer.blocks.is_empty()
+        || offer.version.size > MAX_FILE
+        || (offer.directory && (offer.version.size != 0 || offer.version.hash != [0; 32]))
+    {
+        return Err("invalid file summary".into());
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pending {
@@ -73,6 +84,7 @@ pub(super) struct Storage {
     state: State,
     replace_existing: bool,
     _lock: File,
+    cache: super::cache::ManifestCache,
 }
 
 fn sync_dir(path: &Path) -> Result<(), Error> {
@@ -142,6 +154,7 @@ impl Storage {
             state,
             replace_existing,
             _lock: lock,
+            cache: super::cache::ManifestCache::default(),
         };
         if let Some(pending) = storage.state.pending.take() {
             validate_path(&pending.path)?;
@@ -182,6 +195,10 @@ impl Storage {
         temp.persist(self.internal.join("state.json"))
             .map_err(|e| e.error)?;
         sync_dir(&self.internal)
+    }
+
+    pub(super) fn clear_cache(&mut self) {
+        self.cache.clear();
     }
 
     fn path(&self, relative: &str) -> Result<Option<PathBuf>, Error> {
@@ -248,10 +265,11 @@ impl Storage {
     pub async fn handle_with_progress<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
         io: &mut Framed<S>,
-        offer: Offer,
+        mut offer: Offer,
         report: &mut Report,
         progress: &mut impl FnMut(u64, u64),
     ) -> Result<(), Error> {
+        validate_summary(&offer)?;
         let Some(path) = self.path(&offer.path)? else {
             return Self::conflict(io, report, offer.path).await;
         };
@@ -274,10 +292,23 @@ impl Storage {
         if metadata.as_ref().is_some_and(|m| !m.is_file()) {
             return Self::conflict(io, report, offer.path).await;
         }
-        let existing = self.version(&path)?;
+        if metadata.as_ref().is_some_and(|m| m.len() > MAX_FILE) {
+            return Err("existing target file exceeds size limit".into());
+        }
+        let existing = if metadata.is_some() {
+            let m = self.cache.get(&path, CHUNK)?;
+            Some(Version {
+                hash: m.hash,
+                size: m.size,
+            })
+        } else {
+            None
+        };
         if existing.as_ref() == Some(&offer.version) {
-            self.state.baseline.insert(offer.path, offer.version);
-            self.save()?;
+            if self.state.baseline.get(&offer.path) != Some(&offer.version) {
+                self.state.baseline.insert(offer.path, offer.version);
+                self.save()?;
+            }
             report.unchanged += 1;
             return write(io, &Message::Skip).await;
         }
@@ -291,6 +322,12 @@ impl Storage {
         {
             return Err("baseline capacity exceeded".into());
         }
+        write(io, &Message::NeedBlocks).await?;
+        let Message::Blocks { hashes } = read(io).await? else {
+            return Err("expected requested block list".into());
+        };
+        offer.blocks = hashes;
+        validate_offer(&offer)?;
         let mut staged = Builder::new()
             .prefix(".stage-")
             .tempfile_in(&self.internal)?;
@@ -300,7 +337,7 @@ impl Storage {
         let mut old_blocks = HashMap::new();
         let mut old = None;
         if existing.is_some() {
-            let m = manifest(&path, CHUNK)?;
+            let m = self.cache.get(&path, CHUNK)?;
             for (i, block) in m.blocks.iter().enumerate() {
                 old_blocks
                     .entry((block.hash, block.length))
