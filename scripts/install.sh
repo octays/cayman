@@ -8,10 +8,14 @@ case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) fail 'supported
 case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) fail 'supported architectures: amd64 and arm64' ;; esac
 if command -v sha256sum >/dev/null; then hash=(sha256sum); elif command -v shasum >/dev/null; then hash=(shasum -a 256); else fail 'sha256sum or shasum is required'; fi
 repo=octays/cayman
-install_dir=${CAYMAN_INSTALL_DIR:-"$HOME/.local/bin"}
+install_dir=${CAYMAN_INSTALL_DIR:-/usr/local/bin}
 work=$(mktemp -d)
 staged=''
-cleanup() { rm -rf "$work"; if [[ -n "$staged" ]]; then rm -f "$staged"; fi; }
+needs_sudo=false
+as_admin() {
+  if [[ "$needs_sudo" == true ]]; then sudo -- "$@"; else "$@"; fi
+}
+cleanup() { rm -rf "$work"; if [[ -n "$staged" ]]; then as_admin rm -f "$staged"; fi; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -35,12 +39,18 @@ actual=$("${hash[@]}" "$work/$asset")
 [[ -s "$work/$asset" ]] || fail 'empty executable'
 chmod 755 "$work/$asset"
 "$work/$asset" --version
-mkdir -p "$install_dir"
-staged=$(mktemp "$install_dir/.cayman-install.XXXXXX")
-cp "$work/$asset" "$staged"
-chmod 755 "$staged"
+if ! mkdir -p "$install_dir" 2>/dev/null || [[ ! -w "$install_dir" ]]; then
+  command -v sudo >/dev/null || fail "cannot write to $install_dir; run as root or set CAYMAN_INSTALL_DIR to a writable directory"
+  echo "Administrator permission is required to install into $install_dir."
+  sudo -v || fail 'administrator authorization failed; installed binary was not changed'
+  needs_sudo=true
+fi
+as_admin mkdir -p "$install_dir"
+staged=$(as_admin mktemp "$install_dir/.cayman-install.XXXXXX")
+as_admin cp "$work/$asset" "$staged"
+as_admin chmod 755 "$staged"
 [[ ! -d "$install_dir/cayman" ]] || fail 'destination is a directory'
-mv -f "$staged" "$install_dir/cayman"
+as_admin mv -f "$staged" "$install_dir/cayman"
 staged=''
 echo "Installed $tag to $install_dir/cayman"
 case ":$PATH:" in *":$install_dir:"*) ;; *) printf 'Add to your shell profile: export PATH=%q:$PATH\n' "$install_dir" ;; esac

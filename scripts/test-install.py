@@ -11,7 +11,7 @@ SCRIPT = Path(__file__).resolve().parent / 'install.sh'
 
 
 class InstallTests(unittest.TestCase):
-    def run_case(self, system='Linux', arch='x86_64', corrupt=False, missing=False):
+    def run_case(self, system='Linux', arch='x86_64', corrupt=False, missing=False, privileged=False, deny_sudo=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             mocks = root / 'mocks'
@@ -42,14 +42,18 @@ else
   cp "$TEST_FIXTURE/${url##*/}" "$out"
 fi
 ''')
+            if privileged:
+                (mocks / 'mkdir').write_text('#!/bin/bash\n[[ "${TEST_PRIVILEGED:-0}" == 1 ]] || exit 1\nexec /bin/mkdir "$@"\n')
+                (mocks / 'sudo').write_text('#!/bin/bash\necho "$*" >> "$TEST_FIXTURE/sudo.log"\n[[ "$TEST_DENY_SUDO" == 0 ]] || exit 1\n[[ "$1" == -v ]] && exit 0\n[[ "$1" == -- ]] && shift\nexport TEST_PRIVILEGED=1\nexec "$@"\n')
             for path in mocks.iterdir():
                 path.chmod(0o755)
             result = subprocess.run(['bash', str(SCRIPT)], env={
                 **os.environ, 'PATH': f'{mocks}:{os.environ["PATH"]}',
                 'TEST_OS': system, 'TEST_ARCH': arch, 'TEST_FIXTURE': str(root),
+                'TEST_DENY_SUDO': str(int(deny_sudo)),
                 'TEST_MISSING': str(int(missing)), 'CAYMAN_INSTALL_DIR': str(install),
             }, capture_output=True, text=True)
-            if corrupt or missing or system == 'FreeBSD' or arch == 'riscv64':
+            if corrupt or missing or deny_sudo or system == 'FreeBSD' or arch == 'riscv64':
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual((install / 'cayman').read_text(), 'original')
             else:
@@ -57,6 +61,8 @@ fi
                 self.assertEqual((install / 'cayman').read_bytes(), data)
                 self.assertTrue(os.access(install / 'cayman', os.X_OK))
             self.assertFalse(list(install.glob('.cayman-install.*')))
+            if privileged:
+                self.assertIn('-v', (root / 'sudo.log').read_text())
 
     def test_supported_platforms(self):
         for system, arch in [('Linux', 'x86_64'), ('Linux', 'aarch64'),
@@ -69,6 +75,12 @@ fi
 
     def test_missing_asset_preserves_existing_install(self):
         self.run_case(missing=True)
+
+    def test_privileged_install(self):
+        self.run_case(privileged=True)
+
+    def test_denied_sudo_preserves_install(self):
+        self.run_case(privileged=True, deny_sudo=True)
 
     def test_unsupported_platform(self):
         self.run_case(system='FreeBSD')

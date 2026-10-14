@@ -6,7 +6,7 @@ Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接
 
 ## 安装最新 Release
 
-支持 Linux / macOS 的 amd64 和 arm64。Linux 使用静态 musl 二进制，也适用于 Alpine 和 WSL；其他系统或架构会明确报错。默认安装到 `~/.local/bin`，无需 sudo：
+支持 Linux / macOS 的 amd64 和 arm64。Linux 使用静态 musl 二进制，也适用于 Alpine 和 WSL；其他系统或架构会明确报错。Linux 和 macOS 默认均安装到 `/usr/local/bin/cayman`；目录不可写时，脚本会通过 sudo 请求管理员权限（root 用户无需 sudo）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/install.sh | bash
@@ -19,10 +19,10 @@ curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/instal
 bash install-cayman.sh
 ```
 
-自定义安装位置（需拥有目录写权限）：
+如需无需管理员权限的用户级安装，可自定义目录：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/install.sh | CAYMAN_INSTALL_DIR=/usr/local/bin bash
+curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/install.sh | CAYMAN_INSTALL_DIR="$HOME/.local/bin" bash
 ```
 
 脚本自动识别系统和架构，从 `octays/cayman` 的最新正式 Release 下载对应二进制，校验 SHA-256，验证程序可运行后原子替换。下载或校验失败会保留已有安装。依赖 Bash 3.2+、curl 和 sha256sum 或 shasum。不修改 shell 配置，必要时会提示添加 PATH。仓库需先发布至少一个正式 Release。
