@@ -6,10 +6,20 @@ Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接
 
 ## 安装最新 Release
 
-支持 Linux / macOS 的 amd64 和 arm64。Linux 使用静态 musl 二进制，也适用于 Alpine 和 WSL；其他系统或架构会明确报错。Linux 和 macOS 默认均安装到 `/usr/local/bin/cayman`；目录不可写时，脚本会通过 sudo 请求管理员权限（root 用户无需 sudo）：
+支持 Linux / macOS 的 amd64 和 arm64。Linux 使用静态 musl 二进制，也适用于 Alpine 和 WSL；其他系统或架构会明确报错。
+
+**Linux 和 macOS 默认安装路径均为 `/usr/local/bin/cayman`。** 普通用户在目录不可写时会收到 sudo 密码提示；root 用户直接安装，无需 sudo。
+
+安装或更新到最新正式版：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/install.sh | bash
+```
+
+安装后验证：
+
+```bash
+/usr/local/bin/cayman --version
 ```
 
 也可以先下载脚本再执行：
