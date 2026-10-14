@@ -15,16 +15,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Compare directory contents and estimate missing fixed-size blocks; never writes files.
-    Compare {
-        source: PathBuf,
-        target: PathBuf,
-        #[arg(long, default_value_t = 262144, value_parser = clap::value_parser!(u32).range(4096..=1048576))]
-        chunk_size: u32,
-        /// Emit a machine-readable plan.
-        #[arg(long)]
-        json: bool,
-    },
     /// Share a source directory through a relay and display a one-time invitation.
     #[command(visible_alias = "s")]
     Send {
@@ -35,9 +25,9 @@ pub enum Command {
         listen: Option<SocketAddr>,
         #[command(flatten)]
         relay: RelayArgs,
-        /// Transfer once and exit instead of continuously watching for changes.
+        /// Continuously watch for changes and synchronize incrementally (poll every second).
         #[arg(long)]
-        once: bool,
+        watch: bool,
         /// Write invitation to a new private file outside the source instead of displaying it.
         #[arg(long)]
         code_file: Option<PathBuf>,
@@ -107,22 +97,23 @@ mod tests {
         let Command::Send {
             listen,
             relay,
-            once,
+            watch,
             ..
         } = cli.command
         else {
             panic!("wrong command")
         };
         assert!(listen.is_none());
-        assert!(
-            !once,
-            "continuous incremental synchronization is the default"
-        );
-        let cli = Cli::try_parse_from(["cayman", "send", "source", "--once"]).unwrap();
-        let Command::Send { once, .. } = cli.command else {
+        assert!(!watch, "a single transfer round is the default");
+        let cli = Cli::try_parse_from(["cayman", "send", "source", "--watch"]).unwrap();
+        let Command::Send { watch, .. } = cli.command else {
             panic!("wrong command")
         };
-        assert!(once, "--once must stop after one round");
+        assert!(
+            watch,
+            "--watch must enable continuous incremental synchronization"
+        );
+        assert!(Cli::try_parse_from(["cayman", "send", "source", "--once"]).is_err());
         assert_eq!(relay.address(), cayman::relay::DEFAULT_RELAY);
         let cli = Cli::try_parse_from(["cayman", "receive", "target"]).unwrap();
         let Command::Receive { connect, relay, .. } = cli.command else {

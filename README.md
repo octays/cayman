@@ -2,7 +2,7 @@
 
 Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接，使用 SPAKE2 短码配对和端到端 TLS。发送端只选择源目录，接收端决定目标目录；不提供 local-sync。
 
-命令支持短别名：`s` 等同于 `send`，`r` 等同于 `receive`。例如 `cayman s ./docs --once`、`cayman r .`。
+命令支持短别名：`s` 等同于 `send`，`r` 等同于 `receive`。例如 `cayman s ./docs`、`cayman r .`。
 
 ## 默认通过中继同步
 
@@ -43,16 +43,21 @@ cargo run -- receive ./received-docs --relay relay.example.com:9009
 
 私有中继密码通过 `--relay-password-file /path/to/password` 读取；它与端到端配对码相互独立。无需另写 Cayman relay 服务端。Rust 接入层按 [croc v11.5.3](https://github.com/schollz/croc/tree/v11.5.3) 的传统接入协议实现，不要求用户安装 Go 或 croc 客户端。实际 Go 中继互操作测试仍待在允许联网和监听端口的环境运行，详见 [适配说明](docs/relay-implementation.md)。
 
-默认持续同步，每轮结束后等待 1 秒再扫描。接收端会显示中继连接、配对、目标目录、单行刷新的同步百分比及每轮同步结果；首次同步后提示等待源目录变化。两端均不重复打印无变化的轮询结果。发送端添加 `--once` 只同步一轮，随后发送端和接收端退出，不再监听变化。单轮传输仍会比对和复用已有文件块，此开关不表示强制全量覆盖。无需 `--state-dir`；接收端自动在目标目录内维护 `.cayman` 状态。
-
-只传输一次：
+默认只传输一轮，完成后发送端与接收端均退出。单轮传输也会比对和复用已有文件块。无需 `--state-dir`；接收端自动在目标目录内维护 `.cayman` 状态。
 
 ```bash
-cayman send ./docs --once
-cayman receive ./received-docs
+cayman send ./docs
+cayman receive ./received
 ```
 
-接收端无需额外参数，自动跟随发送端结束本轮会话。
+发送端添加 `--watch` 开启持续增量同步，每轮结束后等待 1 秒再扫描：
+
+```bash
+cayman send ./docs --watch
+cayman receive ./received
+```
+
+接收端无需额外参数，自动跟随发送端的模式。首次同步与后续变化显示单行进度，完成后保留汇总；无变化轮询保持安静。持续模式可用 Ctrl+C 停止。旧的 `--once` 参数已移除。
 
 ## 显式选择直连
 
@@ -90,15 +95,6 @@ cargo run -- receive ./received-docs --connect 192.168.1.10:9009
 当前实现是全目录轮询的单向同步：不传播删除，不保留权限、时间戳等元数据，不实现双向合并、原生文件事件监控或持久化块级断点续传。新文件使用临时文件的私有权限。目标目录应由可信本机用户管理；当前路径检查不能防御恶意本机进程并发替换目录。
 
 接收端目前支持 Unix（macOS/Linux）。原型限制：每轮最多 10,000 个条目、单文件最多 1 GiB，接收端 `--max-bytes` 默认为每轮声明文件总大小 10 GiB。这不是累计磁盘配额；历史备份尚无自动清理策略。JSON 数据帧存在编码开销，尚未实现二进制块编码、CDC、压缩、索引缓存和并行传输。源文件在传输中变化时可能终止本次会话；断线后需重启发送端并使用新码连接。
-
-## 只读比较
-
-```bash
-cargo run -- compare ./source ./target
-cargo run -- compare ./source ./target --chunk-size 262144 --json
-```
-
-这是开发用的只读比较命令，两个路径均须存在，不写入或同步文件。它报告内容差异与固定块复用估算；差异本身不导致失败。正常远程同步请使用上面的两个角色命令。
 
 ## 验证
 

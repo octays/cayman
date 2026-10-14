@@ -240,7 +240,7 @@ cayman receive ./target --name work --relay relay.example.com:9009
 cayman sync run work --watch
 
 # 只生成变化计划，不修改目标文件，也不提交对端游标
-cayman sync run work --once --dry-run --verify=full
+cayman sync run work --dry-run --verify=full
 
 # 查看积压、冲突、对端状态与最近一次完整核验
 cayman sync status work
@@ -253,9 +253,9 @@ cayman sync configure work --mode two-way-safe
 cayman sync unpair work
 ```
 
-发送端不接受接收端目标路径参数；各端只配置本地路径，状态目录由程序自动管理。首次配对后默认持续同步。
+发送端不接受接收端目标路径参数；各端只配置本地路径，状态目录由程序自动管理。默认完成一轮后退出，发送端使用 `--watch` 开启持续增量同步。
 
-策略变更绑定配置代际，两端确认一致后生效；对端不能单方面扩大权限或启用删除。`--once` 完成一轮后退出；有冲突、跳过文件或根不可用不得报全部成功。`--watch` 可显示“已收敛”后继续监听，不把没有当前任务等同于退出。
+策略变更绑定配置代际，两端确认一致后生效；对端不能单方面扩大权限或启用删除。默认完成一轮后退出；有冲突、跳过文件或根不可用不得报全部成功。`--watch` 可显示“已收敛”后继续监听，不把没有当前任务等同于退出。
 
 ## 10. 交付顺序与验收指标
 
