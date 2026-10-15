@@ -6,6 +6,7 @@ pub mod remote;
 pub use compare::{Action, CompareError, Entry, Plan, compare_directories};
 
 mod cache;
+mod chunking;
 
 mod platform;
 mod watch;

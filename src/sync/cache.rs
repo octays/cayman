@@ -1,6 +1,6 @@
 //! Session-local, bounded hash cache. Metadata is a hint; periodic rehashes and
 //! uncached pre-commit checks remain the integrity boundary.
-use super::compare::{CompareError, Manifest, manifest, same_version};
+use super::compare::{CompareError, Manifest, same_version};
 use std::{
     collections::BTreeMap,
     fs,
@@ -17,7 +17,6 @@ const MAX_ENTRIES: usize = 10_000;
 pub(super) struct ManifestCache {
     entries: BTreeMap<PathBuf, (fs::Metadata, Instant, Rc<Manifest>)>,
     blocks: usize,
-    chunk: Option<usize>,
 }
 
 impl ManifestCache {
@@ -26,11 +25,7 @@ impl ManifestCache {
         self.blocks = 0;
     }
 
-    pub fn get(&mut self, path: &Path, chunk: usize) -> Result<Rc<Manifest>, CompareError> {
-        if self.chunk != Some(chunk) {
-            self.clear();
-            self.chunk = Some(chunk);
-        }
+    pub fn get(&mut self, path: &Path) -> Result<Rc<Manifest>, CompareError> {
         let before = fs::symlink_metadata(path).map_err(|source| CompareError::Io {
             path: path.to_owned(),
             source,
@@ -45,7 +40,7 @@ impl ManifestCache {
         if let Some((_, _, old)) = self.entries.remove(path) {
             self.blocks -= old.blocks.len();
         }
-        let value = Rc::new(manifest(path, chunk)?);
+        let value = Rc::new(super::chunking::manifest(path)?);
         let after = fs::symlink_metadata(path).map_err(|source| CompareError::Io {
             path: path.to_owned(),
             source,
@@ -74,14 +69,14 @@ mod tests {
         let file = dir.path().join("file");
         fs::write(&file, b"before").unwrap();
         let mut cache = ManifestCache::default();
-        let first = cache.get(&file, 4096).unwrap();
-        assert!(Rc::ptr_eq(&first, &cache.get(&file, 4096).unwrap()));
+        let first = cache.get(&file).unwrap();
+        assert!(Rc::ptr_eq(&first, &cache.get(&file).unwrap()));
         fs::write(&file, b"after!").unwrap();
-        let next = cache.get(&file, 4096).unwrap();
+        let next = cache.get(&file).unwrap();
         assert_ne!(first.hash, next.hash);
         cache.entries.get_mut(&file).unwrap().1 = Instant::now() - RECHECK;
-        assert!(!Rc::ptr_eq(&next, &cache.get(&file, 4096).unwrap()));
+        assert!(!Rc::ptr_eq(&next, &cache.get(&file).unwrap()));
         fs::remove_file(&file).unwrap();
-        assert!(cache.get(&file, 4096).is_err());
+        assert!(cache.get(&file).is_err());
     }
 }

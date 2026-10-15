@@ -1,8 +1,6 @@
 use super::{
-    compare::manifest,
-    remote::{
-        BLOCK_PAGE, CHUNK, MAX_FILE, MAX_FILES, Message, Offer, Report, Version, read, write,
-    },
+    chunking,
+    remote::{BLOCK_PAGE, MAX_FILE, MAX_FILES, Message, Offer, Report, Version, read, write},
 };
 use crate::{crypto::direct::Error, protocol::frame::Framed};
 use serde::{Deserialize, Serialize};
@@ -50,16 +48,10 @@ pub(super) fn validate_path(path: &str) -> Result<(), Error> {
 
 pub(super) fn validate_offer(offer: &Offer) -> Result<(), Error> {
     validate_path(&offer.path)?;
-    if offer.version.size > MAX_FILE
-        || offer.blocks.len()
-            != if offer.directory {
-                0
-            } else {
-                offer.version.size.div_ceil(CHUNK as u64) as usize
-            }
-    {
-        return Err("invalid file size or block count".into());
+    if offer.version.size > MAX_FILE {
+        return Err("invalid file size".into());
     }
+    chunking::offsets(&offer.blocks, offer.version.size)?;
     if offer.directory && (offer.version.size != 0 || offer.version.hash != [0; 32]) {
         return Err("invalid directory offer".into());
     }
@@ -366,7 +358,7 @@ impl Storage {
                 if m.len() > MAX_FILE {
                     return Err("existing target file exceeds size limit".into());
                 }
-                let m = manifest(path, CHUNK)?;
+                let m = chunking::digest_file(path)?;
                 Ok(Some(Version {
                     hash: m.hash,
                     size: m.size,
@@ -438,7 +430,7 @@ impl Storage {
             return Err("existing target file exceeds size limit".into());
         }
         let existing = if metadata.is_some() {
-            let m = self.cache.get(&path, CHUNK)?;
+            let m = self.cache.get(&path)?;
             Some(Version {
                 hash: m.hash,
                 size: m.size,
@@ -468,10 +460,11 @@ impl Storage {
             return Err("baseline capacity exceeded".into());
         }
         write(io, &Message::NeedBlocks).await?;
-        let expected_count = offer.version.size.div_ceil(CHUNK as u64) as usize;
+        let max_count = offer.version.size.div_ceil(chunking::MIN as u64) as usize;
+        let mut listed_bytes = 0_u64;
         loop {
             let Message::Blocks {
-                hashes,
+                blocks,
                 offset,
                 last,
             } = read(io).await?
@@ -479,18 +472,34 @@ impl Storage {
                 return Err("expected requested block list".into());
             };
             if offset != offer.blocks.len()
-                || hashes.len() > BLOCK_PAGE
-                || offset + hashes.len() > expected_count
-                || (!last && hashes.is_empty())
+                || blocks.len() > BLOCK_PAGE
+                || offset + blocks.len() > max_count
+                || offset + blocks.len() > chunking::MAX_BLOCKS
+                || (!last && blocks.is_empty())
             {
                 return Err("invalid block list page".into());
             }
-            offer.blocks.extend(hashes);
+            for (i, block) in blocks.iter().enumerate() {
+                if block.length == 0
+                    || block.length > chunking::MAX
+                    || ((!last || i + 1 < blocks.len()) && block.length < chunking::MIN)
+                {
+                    return Err("invalid CDC block length".into());
+                }
+                listed_bytes = listed_bytes
+                    .checked_add(block.length as u64)
+                    .ok_or("block size overflow")?;
+                if listed_bytes > offer.version.size {
+                    return Err("block lengths exceed file size".into());
+                }
+            }
+            offer.blocks.extend(blocks);
             if last {
                 break;
             }
         }
         validate_offer(&offer)?;
+        let offsets = chunking::offsets(&offer.blocks, offer.version.size)?;
         let mut staged = Builder::new()
             .prefix(".stage-")
             .tempfile_in(&self.internal)?;
@@ -500,24 +509,26 @@ impl Storage {
         let mut old_blocks = HashMap::new();
         let mut old = None;
         if existing.is_some() {
-            let m = self.cache.get(&path, CHUNK)?;
-            for (i, block) in m.blocks.iter().enumerate() {
+            let m = self.cache.get(&path)?;
+            let mut old_offset = 0_u64;
+            for block in &m.blocks {
                 old_blocks
                     .entry((block.hash, block.length))
-                    .or_insert(i as u64 * CHUNK as u64);
+                    .or_insert(old_offset);
+                old_offset += block.length as u64;
             }
             old = Some(File::open(&path)?);
         }
-        let mut buffer = vec![0; CHUNK];
+        let mut buffer = vec![0; chunking::MAX];
         for (index, expected) in offer.blocks.iter().enumerate() {
-            let offset = index as u64 * CHUNK as u64;
-            let len = (offer.version.size - offset).min(CHUNK as u64) as usize;
-            if let Some(&old_offset) = old_blocks.get(&(*expected, len)) {
+            let offset = offsets[index];
+            let len = expected.length;
+            if let Some(&old_offset) = old_blocks.get(&(expected.hash, len)) {
                 let file = old.as_mut().ok_or("missing reusable file")?;
                 file.seek(SeekFrom::Start(old_offset))?;
                 file.read_exact(&mut buffer[..len])?;
                 let actual: [u8; 32] = Sha256::digest(&buffer[..len]).into();
-                if actual != *expected {
+                if actual != expected.hash {
                     return Err("local reusable block changed".into());
                 }
                 staged.seek(SeekFrom::Start(offset))?;
@@ -541,13 +552,13 @@ impl Storage {
                 let Message::Data { index, bytes } = read(io).await? else {
                     return Err("expected requested block".into());
                 };
-                let offset = expected_index as u64 * CHUNK as u64;
-                let len = (offer.version.size - offset).min(CHUNK as u64) as usize;
+                let offset = offsets[expected_index];
+                let len = offer.blocks[expected_index].length;
                 if index != expected_index || bytes.len() != len {
                     return Err("unexpected block index or length".into());
                 }
                 let hash: [u8; 32] = Sha256::digest(&bytes).into();
-                if hash != offer.blocks[index] {
+                if hash != offer.blocks[index].hash {
                     return Err("block integrity failure".into());
                 }
                 staged.seek(SeekFrom::Start(offset))?;
@@ -664,7 +675,10 @@ mod tests {
             blocks: vec![],
         };
         assert!(validate_offer(&offer).is_err());
-        offer.blocks.push([0; 32]);
+        offer.blocks.push(super::super::compare::Block {
+            hash: [0; 32],
+            length: 1,
+        });
         assert!(validate_offer(&offer).is_ok());
         offer.version.size = MAX_FILE + 1;
         assert!(validate_offer(&offer).is_err());

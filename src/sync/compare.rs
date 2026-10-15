@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -21,6 +21,8 @@ pub enum CompareError {
     Changed(PathBuf),
     #[error("scan resource limit exceeded at {0}")]
     Limit(PathBuf),
+    #[error("CDC block count exceeds 1,048,576 limit at {0}")]
+    BlockLimit(PathBuf),
     #[error("root must be a directory: {0}")]
     NotDirectory(PathBuf),
     #[error("path is not valid UTF-8: {0:?}")]
@@ -125,7 +127,8 @@ pub(super) fn inventory(root: &Path) -> Result<BTreeMap<PathBuf, Kind>, CompareE
     Ok(result)
 }
 
-#[derive(Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Block {
     pub(super) hash: [u8; 32],
     pub(super) length: usize,

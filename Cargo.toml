@@ -1,6 +1,6 @@
 [package]
 name = "cayman"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Secure file transfer and incremental synchronization foundations"
 
@@ -27,6 +27,7 @@ ring = "0.17"
 spake2 = { path = "vendor/spake2", version = "=0.4.0", features = ["std"] }
 curve25519-dalek = "4"
 libc = "0.2.190"
+fastcdc = "=5.0.0"
 
 [profile.release]
 lto = true

@@ -1,5 +1,8 @@
 //! Relay/default and explicit direct TLS synchronization; writes are receiver-owned.
-use super::compare::{Kind, inventory, same_version};
+use super::{
+    chunking,
+    compare::{Block, Kind, inventory, same_version},
+};
 use crate::{
     crypto::{
         direct::{self, Error, Invitation},
@@ -30,7 +33,7 @@ use zeroize::Zeroizing;
 #[error("synchronization has unresolved conflicts")]
 pub(super) struct Conflicts;
 
-pub const CHUNK: usize = 256 * 1024;
+pub const CHUNK: usize = chunking::AVG;
 pub const MAX_FILE: u64 = 256 * 1024 * 1024 * 1024;
 pub(super) const BLOCK_PAGE: usize = 1024;
 pub const MAX_FILES: usize = 100_000;
@@ -49,10 +52,10 @@ pub(super) struct Offer {
     pub path: String,
     pub directory: bool,
     pub version: Version,
-    pub blocks: Vec<[u8; 32]>,
+    pub blocks: Vec<Block>,
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Report {
     pub installed: usize,
@@ -72,7 +75,7 @@ pub(super) enum Message {
     Offer(Offer),
     NeedBlocks,
     Blocks {
-        hashes: Vec<[u8; 32]>,
+        blocks: Vec<Block>,
         offset: usize,
         last: bool,
     },
@@ -84,6 +87,7 @@ pub(super) enum Message {
     },
     Skip,
     Conflict,
+    #[serde(skip)]
     Data {
         index: usize,
         bytes: Vec<u8>,
@@ -100,14 +104,51 @@ pub(super) async fn write<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut Framed<S>,
     message: &Message,
 ) -> Result<(), Error> {
-    let encoded = serde_json::to_vec(message)?;
+    let encoded = encode(message)?;
     io.send(&encoded).await?;
     Ok(())
+}
+// Outer Framed provides a bounded u32 length. Inside a transfer frame, 0 marks
+// JSON control, 1 marks a big-endian u64 block index followed by raw bytes.
+fn encode(message: &Message) -> Result<Vec<u8>, Error> {
+    match message {
+        Message::Data { index, bytes } => {
+            if *index >= chunking::MAX_BLOCKS || bytes.is_empty() || bytes.len() > chunking::MAX {
+                return Err("invalid binary data frame".into());
+            }
+            let mut encoded = Vec::with_capacity(9 + bytes.len());
+            encoded.push(1);
+            encoded.extend_from_slice(&(*index as u64).to_be_bytes());
+            encoded.extend_from_slice(bytes);
+            Ok(encoded)
+        }
+        _ => {
+            let mut encoded = vec![0];
+            serde_json::to_writer(&mut encoded, message)?;
+            Ok(encoded)
+        }
+    }
+}
+fn decode(encoded: &[u8]) -> Result<Message, Error> {
+    match encoded.first() {
+        Some(0) => Ok(serde_json::from_slice(&encoded[1..])?),
+        Some(1) if encoded.len() > 9 && encoded.len() <= chunking::MAX + 9 => {
+            let index = usize::try_from(u64::from_be_bytes(encoded[1..9].try_into()?))?;
+            if index >= chunking::MAX_BLOCKS {
+                return Err("invalid binary block index".into());
+            }
+            Ok(Message::Data {
+                index,
+                bytes: encoded[9..].to_vec(),
+            })
+        }
+        _ => Err("invalid transfer frame type or length".into()),
+    }
 }
 pub(super) async fn read<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut Framed<S>,
 ) -> Result<Message, Error> {
-    Ok(serde_json::from_slice(&io.receive().await?)?)
+    decode(&io.receive().await?)
 }
 
 // Inspect the original spelling before canonicalization removes trailing separators.
@@ -254,7 +295,7 @@ async fn accept_stream<S: AsyncRead + AsyncWrite + Unpin>(
         {
             return Err::<(), Error>("receiver authentication failed".into());
         }
-        io.send(b"cayman-sync/3 ready").await?;
+        io.send(b"cayman-sync/4 ready").await?;
         Ok(())
     })
     .await??;
@@ -292,7 +333,7 @@ async fn receive_stream<S: AsyncRead + AsyncWrite + Unpin>(
     .await??;
     let mut io = Framed::new(tls, MAX_RECORD, IO_TIMEOUT)?;
     io.send(invitation.secret.as_ref()).await?;
-    if io.receive().await? != b"cayman-sync/3 ready" {
+    if io.receive().await? != b"cayman-sync/4 ready" {
         return Err("sender authentication protocol mismatch".into());
     }
     let mut storage = super::receiver::Storage::open(output, replace_existing)?;
@@ -422,7 +463,7 @@ pub(super) async fn sender_with_state<S: AsyncRead + AsyncWrite + Unpin>(
                 if std::fs::symlink_metadata(&full)?.len() > MAX_FILE {
                     return Err("file exceeds protocol limit (256 GiB)".into());
                 }
-                let m = cache.get(&full, CHUNK)?;
+                let m = cache.get(&full)?;
                 Offer {
                     path,
                     directory,
@@ -430,7 +471,7 @@ pub(super) async fn sender_with_state<S: AsyncRead + AsyncWrite + Unpin>(
                         hash: m.hash,
                         size: m.size,
                     },
-                    blocks: m.blocks.iter().map(|b| b.hash).collect(),
+                    blocks: m.blocks.clone(),
                 }
             };
             write(
@@ -449,18 +490,18 @@ pub(super) async fn sender_with_state<S: AsyncRead + AsyncWrite + Unpin>(
                     write(
                         io,
                         &Message::Blocks {
-                            hashes: Vec::new(),
+                            blocks: Vec::new(),
                             offset: 0,
                             last: true,
                         },
                     )
                     .await?;
                 } else {
-                    for (page, hashes) in offer.blocks.chunks(BLOCK_PAGE).enumerate() {
+                    for (page, blocks) in offer.blocks.chunks(BLOCK_PAGE).enumerate() {
                         write(
                             io,
                             &Message::Blocks {
-                                hashes: hashes.to_vec(),
+                                blocks: blocks.to_vec(),
                                 offset: page * BLOCK_PAGE,
                                 last: (page + 1) * BLOCK_PAGE >= offer.blocks.len(),
                             },
@@ -473,6 +514,7 @@ pub(super) async fn sender_with_state<S: AsyncRead + AsyncWrite + Unpin>(
             match response {
                 Message::Skip | Message::Conflict => continue,
                 Message::Need { mut indices } if !directory => {
+                    let offsets = chunking::offsets(&offer.blocks, offer.version.size)?;
                     let mut seen = BTreeSet::new();
                     let mut file = File::open(&full)?;
                     loop {
@@ -486,13 +528,13 @@ pub(super) async fn sender_with_state<S: AsyncRead + AsyncWrite + Unpin>(
                             if index >= offer.blocks.len() || !seen.insert(index) {
                                 return Err("invalid block request".into());
                             }
-                            let offset = index as u64 * CHUNK as u64;
-                            let length = (offer.version.size - offset).min(CHUNK as u64) as usize;
+                            let offset = offsets[index];
+                            let length = offer.blocks[index].length;
                             let mut bytes = vec![0; length];
                             file.seek(SeekFrom::Start(offset))?;
                             file.read_exact(&mut bytes)?;
                             let hash: [u8; 32] = Sha256::digest(&bytes).into();
-                            if hash != offer.blocks[index] {
+                            if hash != offer.blocks[index].hash {
                                 return Err("source changed during transfer".into());
                             }
                             write(io, &Message::Data { index, bytes }).await?;
@@ -710,7 +752,13 @@ mod tests {
             let count = size.div_ceil(CHUNK as u64) as usize;
             for offset in (0..count).step_by(BLOCK_PAGE) {
                 let page = Message::Blocks {
-                    hashes: vec![[0; 32]; BLOCK_PAGE.min(count - offset)],
+                    blocks: vec![
+                        Block {
+                            hash: [0; 32],
+                            length: CHUNK
+                        };
+                        BLOCK_PAGE.min(count - offset)
+                    ],
                     offset,
                     last: offset + BLOCK_PAGE >= count,
                 };
@@ -833,7 +881,7 @@ mod tests {
             write(
                 &mut a,
                 &Message::Blocks {
-                    hashes: Vec::new(),
+                    blocks: Vec::new(),
                     offset: 0,
                     last: true,
                 },
@@ -1021,7 +1069,7 @@ mod tests {
     async fn continuous_source(single_file: bool) {
         let source = tempdir().unwrap();
         let output = tempdir().unwrap();
-        let mut data = [vec![1; CHUNK], vec![2; CHUNK], vec![3; CHUNK]].concat();
+        let mut data = chunking::fixture(4 * chunking::MAX);
         std::fs::write(source.path().join("file"), &data).unwrap();
         let source_arg = if single_file {
             source.path().join("file")
@@ -1052,8 +1100,11 @@ mod tests {
                 ));
                 assert_eq!(std::fs::read(output.path().join("file")).unwrap(), data);
                 if round == 1 {
-                    assert_eq!(report.transferred_bytes, CHUNK as u64);
-                    assert_eq!(report.reused_bytes, (2 * CHUNK) as u64);
+                    assert!(
+                        report.transferred_bytes > 0
+                            && report.transferred_bytes < (2 * chunking::MAX) as u64
+                    );
+                    assert!(report.reused_bytes > (2 * chunking::MAX) as u64);
                 }
                 write(&mut io, &Message::Report(report)).await.unwrap();
                 if round == 0 {
@@ -1144,5 +1195,114 @@ mod tests {
         let (a, b) = round(&source.path().join("."), output.path(), false, 1).await;
         assert!(a.is_err());
         assert!(b.is_err());
+    }
+}
+
+#[cfg(test)]
+mod cdc_tests {
+    use super::*;
+    use tempfile::tempdir;
+    #[test]
+    fn binary_data_frames_fit_maximum_chunks_and_reject_invalid_encodings() {
+        let data = vec![255; chunking::MAX];
+        let encoded = encode(&Message::Data {
+            index: 17,
+            bytes: data.clone(),
+        })
+        .unwrap();
+        assert_eq!(encoded.len(), chunking::MAX + 9);
+        assert!(encoded.len() < MAX_RECORD);
+        let Message::Data { index, bytes } = decode(&encoded).unwrap() else {
+            panic!("data expected")
+        };
+        assert_eq!(index, 17);
+        assert_eq!(bytes, data);
+        for frame in [
+            vec![],
+            vec![2],
+            vec![1; 8],
+            vec![1; 9],
+            vec![1; chunking::MAX + 10],
+            b"\0{\"type\":\"Data\",\"index\":0,\"bytes\":[1]}".to_vec(),
+        ] {
+            assert!(decode(&frame).is_err());
+        }
+        let mut bad = vec![1];
+        bad.extend_from_slice(&u64::MAX.to_be_bytes());
+        bad.push(0);
+        assert!(decode(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn cdc_remote_updates_reuse_shifted_blocks_and_match_fixed_baseline() {
+        let source = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let file = source.path().join("file");
+        let contents = source.path().join(".");
+        let mut data = chunking::fixture(8 * chunking::MAX);
+        for turn in 0..4 {
+            match turn {
+                1 => data.insert(0, 42),
+                2 => {
+                    data.drain(data.len() / 2..data.len() / 2 + 100);
+                }
+                3 => data.extend_from_slice(b"appended content"),
+                _ => {}
+            }
+            std::fs::write(&file, &data).unwrap();
+            let fixed =
+                super::super::compare::compare_directories(source.path(), output.path(), CHUNK)
+                    .unwrap();
+            let (a, b) = tokio::io::duplex(64 * 1024);
+            let mut a = Framed::new(a, MAX_RECORD, Duration::from_secs(10)).unwrap();
+            let mut b = Framed::new(b, MAX_RECORD, Duration::from_secs(10)).unwrap();
+            let receiving = async {
+                let mut storage =
+                    super::super::receiver::Storage::open(output.path(), false).unwrap();
+                assert!(matches!(
+                    read(&mut b).await.unwrap(),
+                    Message::Begin { count: 1 }
+                ));
+                let Message::Offer(offer) = read(&mut b).await.unwrap() else {
+                    panic!("offer expected")
+                };
+                let mut report = Report::default();
+                storage
+                    .handle_with_progress(&mut b, offer, &mut report, &mut |_, _| {})
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    read(&mut b).await.unwrap(),
+                    Message::End { done: true }
+                ));
+                write(&mut b, &Message::Report(report.clone()))
+                    .await
+                    .unwrap();
+                report
+            };
+            let (sent, report) = tokio::join!(
+                sender_session(&contents, &mut a, true, Duration::ZERO),
+                receiving
+            );
+            sent.unwrap();
+            assert_eq!(std::fs::read(output.path().join("file")).unwrap(), data);
+            assert_eq!(
+                report.transferred_bytes + report.reused_bytes,
+                data.len() as u64
+            );
+            if turn > 0 {
+                assert!(
+                    report.reused_bytes > data.len() as u64 * 3 / 4,
+                    "{report:?}"
+                );
+                if turn < 3 {
+                    assert!(report.transferred_bytes < fixed.missing_bytes / 2);
+                }
+            }
+            eprintln!(
+                "CDC case {turn}: fixed={} bytes, CDC={} bytes, reused={} bytes",
+                fixed.missing_bytes, report.transferred_bytes, report.reused_bytes
+            );
+        }
     }
 }

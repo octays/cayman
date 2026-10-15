@@ -71,6 +71,7 @@ pub struct ReceiveOptions {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    chunking: String,
     scope: String,
     prefix: String,
     file: bool,
@@ -247,6 +248,7 @@ async fn sender_engine<S: AsyncRead + AsyncWrite + Unpin>(
     let prefix = prefix.to_str().ok_or("non-UTF8 source name")?.to_owned();
     let scope = format!("{}|{}|{}", root.display(), prefix, file);
     let config = Config {
+        chunking: super::chunking::PROFILE.into(),
         scope: scope.clone(),
         prefix,
         file,
@@ -350,6 +352,9 @@ async fn receiver_engine<S: AsyncRead + AsyncWrite + Unpin>(
     let Control::Start(config) = recv_control(io).await? else {
         return Err("expected synchronization policy".into());
     };
+    if config.chunking != super::chunking::PROFILE {
+        return Err("incompatible chunking profile; update both clients".into());
+    }
     if config.delete && !options.allow_delete {
         let reason = "sender requested deletion; receiver must explicitly pass --delete";
         send_control(
@@ -487,7 +492,7 @@ fn transient(error: &Error) -> bool {
 }
 fn resume_room(invitation: &Invitation) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"cayman/resume/v3");
+    hash.update(b"cayman/resume/v4");
     hash.update(invitation.pin);
     hash.update(invitation.secret.as_ref());
     format!(
@@ -529,7 +534,7 @@ async fn tls_server<S: AsyncRead + AsyncWrite + Unpin>(
     if secret.len() != 32 || !bool::from(secret.as_slice().ct_eq(invitation.secret.as_ref())) {
         return Err("peer authentication failed".into());
     }
-    io.send(b"cayman-session/3").await?;
+    io.send(b"cayman-session/4").await?;
     Ok(io)
 }
 async fn tls_client<S: AsyncRead + AsyncWrite + Unpin>(
@@ -544,7 +549,7 @@ async fn tls_client<S: AsyncRead + AsyncWrite + Unpin>(
     .await??;
     let mut io = Framed::new(tls, MAX_RECORD, IO_TIMEOUT)?;
     io.send(invitation.secret.as_ref()).await?;
-    if io.receive().await? != b"cayman-session/3" {
+    if io.receive().await? != b"cayman-session/4" {
         return Err("incompatible peer; update both clients".into());
     }
     Ok(io)
@@ -692,6 +697,43 @@ pub async fn receive(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[tokio::test]
+    async fn incompatible_chunking_profile_cannot_create_output() {
+        let target = tempdir().unwrap();
+        let output = target.path().join("must-not-exist");
+        let (a, b) = tokio::io::duplex(4096);
+        let mut a = Framed::new(a, MAX_RECORD, Duration::from_secs(3)).unwrap();
+        let mut b = Framed::new(b, MAX_RECORD, Duration::from_secs(3)).unwrap();
+        send_control(
+            &mut a,
+            &Control::Start(Config {
+                chunking: "unknown-profile".into(),
+                scope: "source".into(),
+                prefix: String::new(),
+                file: false,
+                watch: false,
+                delete: false,
+                bidirectional: false,
+            }),
+        )
+        .await
+        .unwrap();
+        let result = receiver_engine(
+            &output,
+            &mut b,
+            &ReceiveOptions::default(),
+            &mut false,
+            &mut false,
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("incompatible chunking profile")
+        );
+        assert!(!output.exists());
+    }
     async fn exchange(
         source: &Path,
         target: &Path,
