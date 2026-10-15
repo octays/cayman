@@ -25,9 +25,17 @@ pub enum Command {
         listen: Option<SocketAddr>,
         #[command(flatten)]
         relay: RelayArgs,
-        /// Continuously watch for changes and synchronize incrementally (poll every second).
+        /// Continuously watch for changes and synchronize incrementally (native events with periodic reconciliation).
         #[arg(long)]
         watch: bool,
+        /// Propagate deletions of previously synchronized files (both peers must opt in).
+        #[arg(long)]
+        delete: bool,
+        /// Synchronize directory changes in both directions (both peers must opt in).
+        #[arg(long)]
+        bidirectional: bool,
+        #[command(flatten)]
+        limits: LimitArgs,
         /// Write invitation to a new private file outside the source instead of displaying it.
         #[arg(long)]
         code_file: Option<PathBuf>,
@@ -48,10 +56,37 @@ pub enum Command {
         /// Allow initial differing target files to be replaced, retaining backup copies.
         #[arg(long)]
         replace_existing: bool,
-        /// Maximum sum of offered file sizes per round, in bytes.
-        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024_u64)]
-        max_bytes: u64,
+        /// Permit deletion of previously synchronized files.
+        #[arg(long)]
+        delete: bool,
+        /// Permit bidirectional directory synchronization.
+        #[arg(long, conflicts_with = "replace_existing")]
+        bidirectional: bool,
+        #[command(flatten)]
+        limits: LimitArgs,
     },
+}
+
+#[derive(Args)]
+pub struct LimitArgs {
+    /// Maximum sum of offered file sizes per round (default: 1 TiB).
+    #[arg(long, default_value_t = 1024 * 1024 * 1024 * 1024_u64)]
+    max_bytes: u64,
+    /// Maximum individual file size (protocol maximum: 256 GiB).
+    #[arg(long, default_value_t = cayman::sync::remote::MAX_FILE)]
+    max_file_bytes: u64,
+    /// Maximum entries per round (protocol maximum: 100,000).
+    #[arg(long, default_value_t = cayman::sync::remote::MAX_FILES)]
+    max_files: usize,
+}
+impl From<LimitArgs> for cayman::sync::session::Limits {
+    fn from(value: LimitArgs) -> Self {
+        Self {
+            max_file_bytes: value.max_file_bytes,
+            max_files: value.max_files,
+            max_bytes: value.max_bytes,
+        }
+    }
 }
 
 #[derive(Args)]

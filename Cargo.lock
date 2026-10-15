@@ -164,7 +164,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cayman"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "clap",
@@ -173,6 +173,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "hmac",
+ "libc",
  "num-bigint",
  "rcgen",
  "ring",
@@ -186,6 +187,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

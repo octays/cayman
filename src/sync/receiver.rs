@@ -1,6 +1,8 @@
 use super::{
     compare::manifest,
-    remote::{CHUNK, MAX_FILE, MAX_FILES, Message, Offer, Report, Version, read, write},
+    remote::{
+        BLOCK_PAGE, CHUNK, MAX_FILE, MAX_FILES, Message, Offer, Report, Version, read, write,
+    },
 };
 use crate::{crypto::direct::Error, protocol::frame::Framed};
 use serde::{Deserialize, Serialize};
@@ -14,19 +16,30 @@ use std::{
 use tempfile::{Builder, NamedTempFile};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-const STATE_LIMIT: u64 = 16 * 1024 * 1024;
+use super::platform::{is_link, real_directory, sync_dir};
+
+const STATE_LIMIT: u64 = 256 * 1024 * 1024;
 
 pub(super) fn validate_path(path: &str) -> Result<(), Error> {
     if path.is_empty() || path.len() > 1024 || path.split('/').count() > 128 {
         return Err("invalid relative path".into());
     }
     for part in path.split('/') {
+        let stem = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            return Err("reserved device filename".into());
+        }
+
         if part.is_empty()
             || part == "."
             || part == ".."
             || part.eq_ignore_ascii_case(".cayman")
             || part.ends_with(['.', ' '])
-            || part.contains(['\\', ':'])
+            || part.contains(['\\', ':', '<', '>', '"', '|', '?', '*'])
             || part.chars().any(char::is_control)
         {
             return Err("unsafe or reserved relative path".into());
@@ -68,7 +81,7 @@ pub(super) fn validate_summary(offer: &Offer) -> Result<(), Error> {
 #[serde(deny_unknown_fields)]
 struct Pending {
     path: String,
-    desired: Version,
+    desired: Option<Version>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +89,12 @@ struct State {
     format: u32,
     baseline: BTreeMap<String, Version>,
     pending: Option<Pending>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    owned: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    directories: std::collections::BTreeSet<String>,
 }
 
 pub(super) struct Storage {
@@ -87,35 +106,25 @@ pub(super) struct Storage {
     cache: super::cache::ManifestCache,
 }
 
-fn sync_dir(path: &Path) -> Result<(), Error> {
-    File::open(path)?.sync_all()?;
-    Ok(())
-}
-
 impl Storage {
     pub fn open(root: &Path, replace_existing: bool) -> Result<Self, Error> {
-        if !cfg!(unix) {
-            return Err("receiver writes currently require Unix directory locks and fsync".into());
-        }
         fs::create_dir_all(root)?;
-        if !fs::symlink_metadata(root)?.is_dir() {
+        if !real_directory(root)? {
             return Err("output must be a real directory".into());
         }
         let root = root.canonicalize()?;
-        let lock = File::open(&root)?;
-        lock.try_lock()
-            .map_err(|_| "another receiver owns this output directory")?;
         let internal = root.join(".cayman");
         if !internal.try_exists()? {
             fs::create_dir(&internal)?;
         }
-        if !fs::symlink_metadata(&internal)?.is_dir() {
+        if !real_directory(&internal)? {
             return Err("invalid receiver state directory".into());
         }
+        let lock = super::platform::lock_root(&root, &internal)?;
         let state_path = internal.join("state.json");
         let state = match fs::symlink_metadata(&state_path) {
             Ok(m) => {
-                if !m.is_file() || m.len() > STATE_LIMIT {
+                if is_link(&m) || !m.is_file() || m.len() > STATE_LIMIT {
                     return Err("invalid receiver state".into());
                 }
                 let mut bytes = Vec::new();
@@ -125,25 +134,36 @@ impl Storage {
                 if bytes.len() as u64 > STATE_LIMIT {
                     return Err("receiver state too large".into());
                 }
-                let state: State = serde_json::from_slice(&bytes)?;
-                if state.format != 1 || state.baseline.len() > MAX_FILES {
+                let mut state: State = serde_json::from_slice(&bytes)?;
+                if !matches!(state.format, 1 | 2) || state.baseline.len() > MAX_FILES {
                     return Err("unsupported receiver state".into());
                 }
-                for path in state.baseline.keys() {
+                state.format = 2;
+                for path in state
+                    .baseline
+                    .keys()
+                    .chain(state.owned.iter())
+                    .chain(state.directories.iter())
+                {
                     validate_path(path)?;
                 }
                 state
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if fs::read_dir(&internal)?.next().is_some() {
+                if fs::read_dir(&internal)?
+                    .any(|entry| entry.map_or(true, |e| e.file_name() != "receiver.lock"))
+                {
                     return Err(
                         "refusing to adopt nonempty .cayman directory without valid state".into(),
                     );
                 }
                 State {
-                    format: 1,
+                    format: 2,
                     baseline: BTreeMap::new(),
                     pending: None,
+                    scope: None,
+                    owned: Default::default(),
+                    directories: Default::default(),
                 }
             }
             Err(e) => return Err(e.into()),
@@ -159,9 +179,15 @@ impl Storage {
         if let Some(pending) = storage.state.pending.take() {
             validate_path(&pending.path)?;
             if let Some(path) = storage.path(&pending.path)?
-                && storage.version(&path)?.as_ref() == Some(&pending.desired)
+                && storage.version(&path)? == pending.desired
             {
-                storage.state.baseline.insert(pending.path, pending.desired);
+                if let Some(version) = pending.desired {
+                    storage.state.owned.insert(pending.path.clone());
+                    storage.state.baseline.insert(pending.path, version);
+                } else {
+                    storage.state.baseline.remove(&pending.path);
+                    storage.state.owned.remove(&pending.path);
+                }
             }
         }
         storage.save()?;
@@ -179,6 +205,116 @@ impl Storage {
         Ok(storage)
     }
 
+    pub(super) fn bind_scope(&mut self, scope: &str, strict: bool) -> Result<(), Error> {
+        if strict && self.state.scope.as_deref().is_some_and(|old| old != scope) {
+            return Err(
+                "output is bound to a different source; select a separate destination".into(),
+            );
+        }
+        if self.state.scope.as_deref() != Some(scope) {
+            self.state.scope = Some(scope.to_owned());
+            // Ordinary transfers can share a destination. Never carry deletion
+            // ownership from a different source or an unbound legacy state.
+            self.state.owned.clear();
+            self.state.directories.clear();
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_absent(
+        &mut self,
+        seen: &std::collections::BTreeSet<String>,
+        report: &mut Report,
+    ) -> Result<(), Error> {
+        #[cfg(windows)]
+        let protected: std::collections::BTreeSet<_> = seen
+            .iter()
+            .filter_map(|name| self.root.join(name).canonicalize().ok())
+            .collect();
+        for name in self.state.owned.clone() {
+            if seen.contains(&name) {
+                continue;
+            }
+            let Some(path) = self.path(&name)? else {
+                report.conflicts.push(name);
+                continue;
+            };
+            #[cfg(windows)]
+            if path
+                .canonicalize()
+                .ok()
+                .is_some_and(|path| protected.contains(&path))
+            {
+                continue;
+            }
+            if let Ok(metadata) = fs::symlink_metadata(&path)
+                && (!metadata.is_file() || is_link(&metadata))
+            {
+                report.conflicts.push(name);
+                continue;
+            }
+            let Some(expected) = self.state.baseline.get(&name).cloned() else {
+                continue;
+            };
+            let current = self.version(&path)?;
+            if let Some(current) = &current {
+                if current != &expected {
+                    report.conflicts.push(name);
+                    continue;
+                }
+                self.backup(&path, &name, &expected)?;
+                if self.version(&path)?.as_ref() != Some(&expected) {
+                    report.conflicts.push(name);
+                    continue;
+                }
+            }
+            self.state.pending = Some(Pending {
+                path: name.clone(),
+                desired: None,
+            });
+            self.save()?;
+            if current.is_some() {
+                fs::remove_file(&path)?;
+                sync_dir(path.parent().ok_or("missing parent")?)?;
+                report.deleted += 1;
+            }
+            self.state.baseline.remove(&name);
+            self.state.owned.remove(&name);
+            self.state.pending = None;
+            self.save()?;
+        }
+        let mut directories: Vec<_> = self.state.directories.iter().cloned().collect();
+        directories.sort_by_key(|p| std::cmp::Reverse(p.split('/').count()));
+        for name in directories {
+            if seen.contains(&name) {
+                continue;
+            }
+            let Some(path) = self.path(&name)? else {
+                continue;
+            };
+            #[cfg(windows)]
+            if path
+                .canonicalize()
+                .ok()
+                .is_some_and(|path| protected.contains(&path))
+            {
+                continue;
+            }
+            match fs::remove_dir(&path) {
+                Ok(()) => {
+                    sync_dir(path.parent().ok_or("missing parent")?)?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => continue,
+                Err(e) => return Err(e.into()),
+            }
+            self.state.directories.remove(&name);
+            self.save()?;
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<(), Error> {
         if self.state.baseline.len() > MAX_FILES {
             return Err("baseline capacity exceeded".into());
@@ -194,7 +330,7 @@ impl Storage {
         temp.as_file().sync_all()?;
         temp.persist(self.internal.join("state.json"))
             .map_err(|e| e.error)?;
-        sync_dir(&self.internal)
+        Ok(sync_dir(&self.internal)?)
     }
 
     pub(super) fn clear_cache(&mut self) {
@@ -205,7 +341,7 @@ impl Storage {
         validate_path(relative)?;
         // Local roots are trusted; reject symlinks/types at every observed component.
         // Directory-handle-based protection against hostile local renames is future work.
-        if !fs::symlink_metadata(&self.root)?.is_dir() {
+        if !real_directory(&self.root)? {
             return Err("output root disappeared".into());
         }
         let mut path = self.root.clone();
@@ -213,7 +349,7 @@ impl Storage {
         for (index, part) in parts.iter().enumerate() {
             path.push(part);
             match fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_symlink() => return Ok(None),
+                Ok(m) if is_link(&m) => return Ok(None),
                 Ok(m) if index + 1 < parts.len() && !m.is_dir() => return Ok(None),
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound && index + 1 == parts.len() => {}
@@ -251,7 +387,7 @@ impl Storage {
         write(io, &Message::Conflict).await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
         io: &mut Framed<S>,
@@ -283,9 +419,15 @@ impl Storage {
                 return Self::conflict(io, report, offer.path).await;
             }
             if metadata.is_none() {
+                if self.state.directories.contains(&offer.path) {
+                    return Self::conflict(io, report, offer.path).await;
+                }
                 progress(0, 0);
                 fs::create_dir(&path)?;
                 sync_dir(path.parent().ok_or("missing parent")?)?;
+            }
+            if self.state.directories.insert(offer.path.clone()) {
+                self.save()?;
             }
             return write(io, &Message::Skip).await;
         }
@@ -305,7 +447,10 @@ impl Storage {
             None
         };
         if existing.as_ref() == Some(&offer.version) {
-            if self.state.baseline.get(&offer.path) != Some(&offer.version) {
+            if self.state.baseline.get(&offer.path) != Some(&offer.version)
+                || !self.state.owned.contains(&offer.path)
+            {
+                self.state.owned.insert(offer.path.clone());
                 self.state.baseline.insert(offer.path, offer.version);
                 self.save()?;
             }
@@ -323,10 +468,28 @@ impl Storage {
             return Err("baseline capacity exceeded".into());
         }
         write(io, &Message::NeedBlocks).await?;
-        let Message::Blocks { hashes } = read(io).await? else {
-            return Err("expected requested block list".into());
-        };
-        offer.blocks = hashes;
+        let expected_count = offer.version.size.div_ceil(CHUNK as u64) as usize;
+        loop {
+            let Message::Blocks {
+                hashes,
+                offset,
+                last,
+            } = read(io).await?
+            else {
+                return Err("expected requested block list".into());
+            };
+            if offset != offer.blocks.len()
+                || hashes.len() > BLOCK_PAGE
+                || offset + hashes.len() > expected_count
+                || (!last && hashes.is_empty())
+            {
+                return Err("invalid block list page".into());
+            }
+            offer.blocks.extend(hashes);
+            if last {
+                break;
+            }
+        }
         validate_offer(&offer)?;
         let mut staged = Builder::new()
             .prefix(".stage-")
@@ -364,33 +527,42 @@ impl Storage {
                 needed.push(index);
             }
         }
+        progress(0, offer.version.size - reused);
+        let mut transferred = 0_u64;
+        for page in needed.chunks(BLOCK_PAGE) {
+            write(
+                io,
+                &Message::Need {
+                    indices: page.to_vec(),
+                },
+            )
+            .await?;
+            for &expected_index in page {
+                let Message::Data { index, bytes } = read(io).await? else {
+                    return Err("expected requested block".into());
+                };
+                let offset = expected_index as u64 * CHUNK as u64;
+                let len = (offer.version.size - offset).min(CHUNK as u64) as usize;
+                if index != expected_index || bytes.len() != len {
+                    return Err("unexpected block index or length".into());
+                }
+                let hash: [u8; 32] = Sha256::digest(&bytes).into();
+                if hash != offer.blocks[index] {
+                    return Err("block integrity failure".into());
+                }
+                staged.seek(SeekFrom::Start(offset))?;
+                staged.write_all(&bytes)?;
+                transferred += len as u64;
+                progress(transferred, offer.version.size - reused);
+            }
+        }
         write(
             io,
             &Message::Need {
-                indices: needed.clone(),
+                indices: Vec::new(),
             },
         )
         .await?;
-        progress(0, offer.version.size - reused);
-        let mut transferred = 0_u64;
-        for expected_index in needed {
-            let Message::Data { index, bytes } = read(io).await? else {
-                return Err("expected requested block".into());
-            };
-            let offset = expected_index as u64 * CHUNK as u64;
-            let len = (offer.version.size - offset).min(CHUNK as u64) as usize;
-            if index != expected_index || bytes.len() != len {
-                return Err("unexpected block index or length".into());
-            }
-            let hash: [u8; 32] = Sha256::digest(&bytes).into();
-            if hash != offer.blocks[index] {
-                return Err("block integrity failure".into());
-            }
-            staged.seek(SeekFrom::Start(offset))?;
-            staged.write_all(&bytes)?;
-            transferred += len as u64;
-            progress(transferred, offer.version.size - reused);
-        }
         if !matches!(read(io).await?, Message::Finish) {
             return Err("expected file finish".into());
         }
@@ -406,10 +578,11 @@ impl Storage {
         }
         self.state.pending = Some(Pending {
             path: offer.path.clone(),
-            desired: offer.version.clone(),
+            desired: Some(offer.version.clone()),
         });
         self.save()?;
         self.install(staged, &path, existing.is_some())?;
+        self.state.owned.insert(offer.path.clone());
         self.state.baseline.insert(offer.path, offer.version);
         self.state.pending = None;
         self.save()?;
@@ -426,7 +599,7 @@ impl Storage {
             staged.persist_noclobber(path).map_err(|e| e.error)?;
         }
         sync_dir(path.parent().ok_or("missing parent")?)?;
-        sync_dir(&self.internal)
+        Ok(sync_dir(&self.internal)?)
     }
 
     fn backup(&self, target: &Path, relative: &str, expected: &Version) -> Result<(), Error> {
@@ -451,11 +624,11 @@ impl Storage {
         )?;
         info.as_file().sync_all()?;
         info.keep().map_err(|e| e.error)?;
-        sync_dir(&self.internal)
+        Ok(sync_dir(&self.internal)?)
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -473,6 +646,10 @@ mod tests {
             "a/./b",
             "a:",
             "file\n",
+            "CON.txt",
+            "dir/NUL",
+            "COM1",
+            "file?",
         ] {
             assert!(validate_path(path).is_err(), "{path:?}");
         }
@@ -494,13 +671,58 @@ mod tests {
     }
 
     #[test]
+    fn scope_changes_do_not_carry_deletion_ownership() {
+        let output = tempdir().unwrap();
+        let mut storage = Storage::open(output.path(), false).unwrap();
+        storage.bind_scope("first", false).unwrap();
+        storage.state.owned.insert("first-file".into());
+        assert!(storage.bind_scope("second", true).is_err());
+        storage.bind_scope("second", false).unwrap();
+        assert!(storage.state.owned.is_empty());
+        storage.bind_scope("second", true).unwrap();
+    }
+
+    #[test]
+    fn deletion_journal_recovery_commits_only_completed_removals() {
+        let output = tempdir().unwrap();
+        let path = output.path().join("file");
+        fs::write(&path, b"keep until removed").unwrap();
+        let mut storage = Storage::open(output.path(), false).unwrap();
+        let version = storage.version(&path).unwrap().unwrap();
+        storage.state.baseline.insert("file".into(), version);
+        storage.state.owned.insert("file".into());
+        storage.state.pending = Some(Pending {
+            path: "file".into(),
+            desired: None,
+        });
+        storage.save().unwrap();
+        drop(storage);
+        let mut storage = Storage::open(output.path(), false).unwrap();
+        assert!(storage.state.baseline.contains_key("file"));
+        storage.state.pending = Some(Pending {
+            path: "file".into(),
+            desired: None,
+        });
+        storage.save().unwrap();
+        fs::remove_file(&path).unwrap();
+        drop(storage);
+        let storage = Storage::open(output.path(), false).unwrap();
+        assert!(!storage.state.baseline.contains_key("file"));
+        assert!(!storage.state.owned.contains("file"));
+        assert!(storage.state.pending.is_none());
+    }
+
+    #[test]
     fn lock_and_symlink_guards_and_journal_recovery() {
         let output = tempdir().unwrap();
-        let outside = tempdir().unwrap();
         let mut storage = Storage::open(output.path(), false).unwrap();
         assert!(Storage::open(output.path(), false).is_err());
-        std::os::unix::fs::symlink(outside.path(), output.path().join("escape")).unwrap();
-        assert!(storage.path("escape/file").unwrap().is_none());
+        #[cfg(unix)]
+        {
+            let outside = tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), output.path().join("escape")).unwrap();
+            assert!(storage.path("escape/file").unwrap().is_none());
+        }
         fs::write(output.path().join("file"), b"installed").unwrap();
         let version = storage
             .version(&output.path().join("file"))
@@ -508,7 +730,7 @@ mod tests {
             .unwrap();
         storage.state.pending = Some(Pending {
             path: "file".into(),
-            desired: version.clone(),
+            desired: Some(version.clone()),
         });
         storage.save().unwrap();
         drop(storage);

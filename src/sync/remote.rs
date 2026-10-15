@@ -26,9 +26,14 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
 
+#[derive(Debug, thiserror::Error)]
+#[error("synchronization has unresolved conflicts")]
+pub(super) struct Conflicts;
+
 pub const CHUNK: usize = 256 * 1024;
-pub const MAX_FILE: u64 = 1024 * 1024 * 1024;
-pub const MAX_FILES: usize = 10_000;
+pub const MAX_FILE: u64 = 256 * 1024 * 1024 * 1024;
+pub(super) const BLOCK_PAGE: usize = 1024;
+pub const MAX_FILES: usize = 100_000;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +56,7 @@ pub(super) struct Offer {
 #[serde(deny_unknown_fields)]
 pub struct Report {
     pub installed: usize,
+    pub deleted: usize,
     pub unchanged: usize,
     pub transferred_bytes: u64,
     pub reused_bytes: u64,
@@ -60,20 +66,33 @@ pub struct Report {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub(super) enum Message {
-    Begin { count: usize },
+    Begin {
+        count: usize,
+    },
     Offer(Offer),
     NeedBlocks,
-    Blocks { hashes: Vec<[u8; 32]> },
+    Blocks {
+        hashes: Vec<[u8; 32]>,
+        offset: usize,
+        last: bool,
+    },
     Recheck,
     Ping,
     Pong,
-    Need { indices: Vec<usize> },
+    Need {
+        indices: Vec<usize>,
+    },
     Skip,
     Conflict,
-    Data { index: usize, bytes: Vec<u8> },
+    Data {
+        index: usize,
+        bytes: Vec<u8>,
+    },
     Finish,
     Committed,
-    End { done: bool },
+    End {
+        done: bool,
+    },
     Report(Report),
 }
 
@@ -92,13 +111,13 @@ pub(super) async fn read<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 // Inspect the original spelling before canonicalization removes trailing separators.
-fn source_layout(source: &Path) -> Result<(PathBuf, PathBuf), Error> {
+pub(super) fn source_layout(source: &Path) -> Result<(PathBuf, PathBuf), Error> {
     let raw = source.as_os_str().to_str().ok_or("non-UTF8 source path")?;
     let contents = raw.ends_with(std::path::is_separator)
         || raw.rsplit(std::path::is_separator).next() == Some(".");
     let lexical: PathBuf = source.components().collect();
     let metadata = std::fs::symlink_metadata(&lexical)?;
-    if !metadata.is_dir() && !metadata.is_file() {
+    if super::platform::is_link(&metadata) || (!metadata.is_dir() && !metadata.is_file()) {
         return Err("source must be a regular file or a real directory".into());
     }
     if metadata.is_file() && contents {
@@ -119,7 +138,7 @@ fn source_layout(source: &Path) -> Result<(PathBuf, PathBuf), Error> {
     Ok((root, prefix))
 }
 
-fn normalized_source(source: &Path) -> Result<PathBuf, Error> {
+pub(super) fn normalized_source(source: &Path) -> Result<PathBuf, Error> {
     let (root, prefix) = source_layout(source)?;
     Ok(if prefix.as_os_str().is_empty() {
         root.join(".")
@@ -150,7 +169,7 @@ pub async fn send(
     accept_stream(tcp, config, &invitation, &source, once).await
 }
 
-fn write_code(source: &Path, code: &str, code_file: Option<&Path>) -> Result<(), Error> {
+pub(super) fn write_code(source: &Path, code: &str, code_file: Option<&Path>) -> Result<(), Error> {
     if let Some(path) = code_file {
         if path.canonicalize().is_ok_and(|p| p.starts_with(source))
             || path
@@ -235,7 +254,7 @@ async fn accept_stream<S: AsyncRead + AsyncWrite + Unpin>(
         {
             return Err::<(), Error>("receiver authentication failed".into());
         }
-        io.send(b"cayman-sync/2 ready").await?;
+        io.send(b"cayman-sync/3 ready").await?;
         Ok(())
     })
     .await??;
@@ -273,7 +292,7 @@ async fn receive_stream<S: AsyncRead + AsyncWrite + Unpin>(
     .await??;
     let mut io = Framed::new(tls, MAX_RECORD, IO_TIMEOUT)?;
     io.send(invitation.secret.as_ref()).await?;
-    if io.receive().await? != b"cayman-sync/2 ready" {
+    if io.receive().await? != b"cayman-sync/3 ready" {
         return Err("sender authentication protocol mismatch".into());
     }
     let mut storage = super::receiver::Storage::open(output, replace_existing)?;
@@ -287,17 +306,22 @@ async fn receive_stream<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Print the first round and subsequent changes, without repeating idle polls.
 #[derive(Default)]
-struct RoundLog {
+pub(super) struct RoundLog {
     started: bool,
     conflicts: Vec<String>,
 }
 impl RoundLog {
-    fn report(&mut self, report: &Report) {
-        if !self.started || report.installed > 0 || self.conflicts != report.conflicts {
+    pub(super) fn report(&mut self, report: &Report) {
+        if !self.started
+            || report.installed > 0
+            || report.deleted > 0
+            || self.conflicts != report.conflicts
+        {
             eprintln!(
-                "Files: {} updated, {} unchanged | Conflicts: {}",
+                "Files: {} updated, {} unchanged, {} deleted | Conflicts: {}",
                 report.installed,
                 report.unchanged,
+                report.deleted,
                 report.conflicts.len()
             );
             eprintln!(
@@ -313,16 +337,36 @@ impl RoundLog {
     }
 }
 
+#[derive(Default)]
+pub(super) struct SendState {
+    cache: super::cache::ManifestCache,
+    pub(super) log: RoundLog,
+}
+impl SendState {
+    pub(super) fn clear_cache(&mut self) {
+        self.cache.clear();
+    }
+}
+
 pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
     source: &Path,
     io: &mut Framed<S>,
     once: bool,
     interval: Duration,
 ) -> Result<(), Error> {
+    sender_with_state(source, io, once, interval, &mut SendState::default()).await
+}
+
+pub(super) async fn sender_with_state<S: AsyncRead + AsyncWrite + Unpin>(
+    source: &Path,
+    io: &mut Framed<S>,
+    once: bool,
+    interval: Duration,
+    state: &mut SendState,
+) -> Result<(), Error> {
     let (source, prefix) = source_layout(source)?;
     let single_file = std::fs::symlink_metadata(&source)?.is_file();
-    let mut log = RoundLog::default();
-    let mut cache = super::cache::ManifestCache::default();
+    let SendState { cache, log } = state;
     let mut rechecked = Instant::now();
     loop {
         let snapshot = source_snapshot(&source, single_file)?;
@@ -376,7 +420,7 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             } else {
                 if std::fs::symlink_metadata(&full)?.len() > MAX_FILE {
-                    return Err("file exceeds 1 GiB direct-prototype limit".into());
+                    return Err("file exceeds protocol limit (256 GiB)".into());
                 }
                 let m = cache.get(&full, CHUNK)?;
                 Offer {
@@ -401,39 +445,62 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
             .await?;
             let mut response = read(io).await?;
             if matches!(response, Message::NeedBlocks) && !directory {
-                write(
-                    io,
-                    &Message::Blocks {
-                        hashes: offer.blocks.clone(),
-                    },
-                )
-                .await?;
+                if offer.blocks.is_empty() {
+                    write(
+                        io,
+                        &Message::Blocks {
+                            hashes: Vec::new(),
+                            offset: 0,
+                            last: true,
+                        },
+                    )
+                    .await?;
+                } else {
+                    for (page, hashes) in offer.blocks.chunks(BLOCK_PAGE).enumerate() {
+                        write(
+                            io,
+                            &Message::Blocks {
+                                hashes: hashes.to_vec(),
+                                offset: page * BLOCK_PAGE,
+                                last: (page + 1) * BLOCK_PAGE >= offer.blocks.len(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
                 response = read(io).await?;
             }
             match response {
                 Message::Skip | Message::Conflict => continue,
-                Message::Need { indices } if !directory => {
-                    if indices.len() > offer.blocks.len() {
-                        return Err("invalid block request".into());
-                    }
+                Message::Need { mut indices } if !directory => {
                     let mut seen = BTreeSet::new();
                     let mut file = File::open(&full)?;
-                    for index in indices {
-                        if index >= offer.blocks.len() || !seen.insert(index) {
-                            return Err("invalid block request".into());
+                    loop {
+                        if indices.len() > BLOCK_PAGE {
+                            return Err("block request page too large".into());
                         }
-                        let offset = index as u64 * CHUNK as u64;
-                        let length = (offer.version.size - offset).min(CHUNK as u64) as usize;
-                        let mut bytes = vec![0; length];
-                        file.seek(SeekFrom::Start(offset))?;
-                        file.read_exact(&mut bytes)?;
-                        let hash: [u8; 32] = Sha256::digest(&bytes).into();
-                        if hash != offer.blocks[index] {
-                            return Err(
-                                "source changed during transfer; reconnect to rescan".into()
-                            );
+                        if indices.is_empty() {
+                            break;
                         }
-                        write(io, &Message::Data { index, bytes }).await?;
+                        for index in indices {
+                            if index >= offer.blocks.len() || !seen.insert(index) {
+                                return Err("invalid block request".into());
+                            }
+                            let offset = index as u64 * CHUNK as u64;
+                            let length = (offer.version.size - offset).min(CHUNK as u64) as usize;
+                            let mut bytes = vec![0; length];
+                            file.seek(SeekFrom::Start(offset))?;
+                            file.read_exact(&mut bytes)?;
+                            let hash: [u8; 32] = Sha256::digest(&bytes).into();
+                            if hash != offer.blocks[index] {
+                                return Err("source changed during transfer".into());
+                            }
+                            write(io, &Message::Data { index, bytes }).await?;
+                        }
+                        let Message::Need { indices: next } = read(io).await? else {
+                            return Err("expected next block request page".into());
+                        };
+                        indices = next;
                     }
                     write(io, &Message::Finish).await?;
                     match read(io).await? {
@@ -455,7 +522,7 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
         }
         if once {
             if !report.conflicts.is_empty() {
-                return Err("synchronization has unresolved conflicts".into());
+                return Err(Box::new(Conflicts) as Error);
             }
             return Ok(());
         }
@@ -478,7 +545,7 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-fn source_snapshot(
+pub(super) fn source_snapshot(
     root: &Path,
     single_file: bool,
 ) -> Result<BTreeMap<PathBuf, std::fs::Metadata>, Error> {
@@ -505,7 +572,7 @@ fn source_snapshot(
         .collect()
 }
 
-fn same_snapshot(
+pub(super) fn same_snapshot(
     a: &BTreeMap<PathBuf, std::fs::Metadata>,
     b: &BTreeMap<PathBuf, std::fs::Metadata>,
 ) -> bool {
@@ -522,7 +589,27 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut Framed<S>,
     max_bytes: u64,
 ) -> Result<(), Error> {
-    let mut log = RoundLog::default();
+    receiver_with_policy(
+        storage,
+        io,
+        max_bytes,
+        false,
+        MAX_FILES,
+        MAX_FILE,
+        &mut RoundLog::default(),
+    )
+    .await
+}
+
+pub(super) async fn receiver_with_policy<S: AsyncRead + AsyncWrite + Unpin>(
+    storage: &mut super::receiver::Storage,
+    io: &mut Framed<S>,
+    max_bytes: u64,
+    delete: bool,
+    max_files: usize,
+    max_file: u64,
+    log: &mut RoundLog,
+) -> Result<(), Error> {
     loop {
         let message = read(io).await?;
         if matches!(message, Message::Recheck) {
@@ -536,7 +623,7 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
         let Message::Begin { count } = message else {
             return Err("expected round begin".into());
         };
-        if count > MAX_FILES {
+        if count > max_files {
             return Err("too many remote entries".into());
         }
         let mut progress = super::progress::Progress::new(count, !log.started);
@@ -548,6 +635,9 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
                 return Err("expected file offer".into());
             };
             super::receiver::validate_summary(&offer)?;
+            if offer.version.size > max_file {
+                return Err("file exceeds configured receiver limit".into());
+            }
             if !seen.insert(offer.path.clone()) {
                 return Err("duplicate offer path".into());
             }
@@ -567,6 +657,9 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
         let Message::End { done } = read(io).await? else {
             return Err("expected round end".into());
         };
+        if delete {
+            storage.delete_absent(&seen, &mut report)?;
+        }
         progress.finish();
         let conflicts = !report.conflicts.is_empty();
         let first_round = !log.started;
@@ -579,9 +672,8 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
         }
         if done {
             if conflicts {
-                return Err("synchronization has unresolved conflicts".into());
+                return Err(Box::new(Conflicts) as Error);
             }
-            eprintln!("Synchronization complete.");
             return Ok(());
         }
     }
@@ -591,6 +683,55 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn file_above_one_gib_accepts_paged_hashes_and_bounded_requests() {
+        let output = tempdir().unwrap();
+        let (a, b) = tokio::io::duplex(8192);
+        let peer = async {
+            let mut io = Framed::new(a, MAX_RECORD, Duration::from_secs(3)).unwrap();
+            write(&mut io, &Message::Begin { count: 1 }).await.unwrap();
+            let size = 2 * 1024 * 1024 * 1024;
+            write(
+                &mut io,
+                &Message::Offer(Offer {
+                    path: "large".into(),
+                    directory: false,
+                    version: Version {
+                        hash: [0; 32],
+                        size,
+                    },
+                    blocks: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(read(&mut io).await.unwrap(), Message::NeedBlocks));
+            let count = size.div_ceil(CHUNK as u64) as usize;
+            for offset in (0..count).step_by(BLOCK_PAGE) {
+                let page = Message::Blocks {
+                    hashes: vec![[0; 32]; BLOCK_PAGE.min(count - offset)],
+                    offset,
+                    last: offset + BLOCK_PAGE >= count,
+                };
+                assert!(serde_json::to_vec(&page).unwrap().len() < MAX_RECORD);
+                write(&mut io, &page).await.unwrap();
+            }
+            let Message::Need { indices } = read(&mut io).await.unwrap() else {
+                panic!("expected block request")
+            };
+            assert_eq!(indices.len(), BLOCK_PAGE);
+            // Disconnect: the 2 GiB staging file must not become visible.
+        };
+        let receive = async {
+            let mut io = Framed::new(b, MAX_RECORD, Duration::from_secs(3)).unwrap();
+            let mut storage = super::super::receiver::Storage::open(output.path(), false).unwrap();
+            receiver_session(&mut storage, &mut io, MAX_FILE).await
+        };
+        let ((), result) = tokio::join!(peer, receive);
+        assert!(result.is_err());
+        assert!(!output.path().join("large").exists());
+    }
 
     #[tokio::test]
     async fn single_file_transfer_reuses_blocks_and_excludes_siblings() {
@@ -689,9 +830,16 @@ mod tests {
             .await
             .unwrap();
             assert!(matches!(read(&mut a).await.unwrap(), Message::NeedBlocks));
-            write(&mut a, &Message::Blocks { hashes: Vec::new() })
-                .await
-                .unwrap();
+            write(
+                &mut a,
+                &Message::Blocks {
+                    hashes: Vec::new(),
+                    offset: 0,
+                    last: true,
+                },
+            )
+            .await
+            .unwrap();
         };
         let ((), received) = tokio::join!(peer, receiver_session(&mut storage, &mut b, MAX_FILE));
         assert!(received.is_err());

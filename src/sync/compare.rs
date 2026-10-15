@@ -8,7 +8,7 @@ use std::{
 };
 
 const MAX_ENTRIES: usize = 100_000;
-const MAX_BLOCKS_PER_FILE: u64 = 1_000_000;
+const MAX_BLOCKS_PER_FILE: u64 = 1_048_576;
 const MAX_DEPTH: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
@@ -75,7 +75,7 @@ pub(super) enum Kind {
 
 pub(super) fn inventory(root: &Path) -> Result<BTreeMap<PathBuf, Kind>, CompareError> {
     let meta = fs::symlink_metadata(root).map_err(|e| io_error(root, e))?;
-    if !meta.is_dir() {
+    if !meta.is_dir() || super::platform::is_link(&meta) {
         return Err(CompareError::NotDirectory(root.to_owned()));
     }
     let mut result = BTreeMap::new();
@@ -87,15 +87,23 @@ pub(super) fn inventory(root: &Path) -> Result<BTreeMap<PathBuf, Kind>, CompareE
         }
         // Catch directory replacement before traversal (not a hostile-filesystem sandbox).
         let metadata = fs::symlink_metadata(&directory).map_err(|e| io_error(&directory, e))?;
-        if !metadata.is_dir() {
+        if !metadata.is_dir() || super::platform::is_link(&metadata) {
             return Err(CompareError::Changed(directory));
         }
         for item in fs::read_dir(&directory).map_err(|e| io_error(&directory, e))? {
             let item = item.map_err(|e| io_error(&directory, e))?;
+            if item.file_name().eq_ignore_ascii_case(".cayman") {
+                continue;
+            }
             let path = item.path();
             let relative_path = relative.join(item.file_name());
             if relative_path.to_str().is_none() {
                 return Err(CompareError::Encoding(path));
+            }
+            if super::platform::is_link(
+                &fs::symlink_metadata(&path).map_err(|e| io_error(&path, e))?,
+            ) {
+                return Err(CompareError::Unsupported(path));
             }
             let kind = item.file_type().map_err(|e| io_error(&path, e))?;
             let kind = if kind.is_dir() {
@@ -147,7 +155,7 @@ pub(super) fn same_version(a: &Metadata, b: &Metadata) -> bool {
 
 pub(super) fn manifest(path: &Path, chunk_size: usize) -> Result<Manifest, CompareError> {
     let before = fs::symlink_metadata(path).map_err(|e| io_error(path, e))?;
-    if !before.is_file() {
+    if !before.is_file() || super::platform::is_link(&before) {
         return Err(CompareError::Unsupported(path.to_owned()));
     }
     if before.len().div_ceil(chunk_size as u64) > MAX_BLOCKS_PER_FILE {

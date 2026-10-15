@@ -6,7 +6,7 @@ Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接
 
 ## 安装最新 Release
 
-支持 Linux / macOS 的 amd64 和 arm64。Linux 使用静态 musl 二进制，也适用于 Alpine 和 WSL；其他系统或架构会明确报错。
+安装脚本支持 Linux / macOS 的 amd64 和 arm64。Windows amd64 可从 Release 下载 `cayman-windows-amd64.exe`，改名为 `cayman.exe` 后放入 PATH。Linux 使用静态 musl 二进制，也适用于 Alpine 和 WSL；其他系统或架构会明确报错。
 
 **Linux 和 macOS 默认安装路径均为 `/usr/local/bin/cayman`。** 普通用户在目录不可写时会收到 sudo 密码提示；root 用户直接安装，无需 sudo。
 
@@ -39,23 +39,24 @@ curl -fsSL https://raw.githubusercontent.com/octays/cayman/master/scripts/instal
 
 ## 构建与发布
 
-[Release 工作流](.github/workflows/release.yml) 在推送 `v*` 标签时构建四种独立二进制文件：
+[Release 工作流](.github/workflows/release.yml) 在推送 `v*` 标签时构建五种独立二进制文件：
 
 - `cayman-linux-amd64`
 - `cayman-linux-arm64`
 - `cayman-darwin-amd64`
 - `cayman-darwin-arm64`
+- `cayman-windows-amd64.exe`
 
-每个二进制附带 `.sha256` 文件。Linux 必须通过 UPX 压缩、完整性检测和运行检查；macOS 尝试 UPX，格式不支持或运行检查失败时保留原二进制。构建日志记录最终压缩方式；依赖的许可证和来源说明作为独立附件保留。所有平台构建成功后创建并发布 GitHub Release；带连字符的版本标签（如 `v0.2.0-rc.1`）标记为预发布，安装脚本不会选择它。手动运行工作流可下载构建产物，只有标签运行会发布 Release。
+每个二进制附带 `.sha256` 文件。Linux 和 Windows 必须通过 UPX 压缩、完整性检测和运行检查；macOS 尝试 UPX，格式不支持或运行检查失败时保留原二进制。构建日志记录最终压缩方式；依赖的许可证和来源说明作为独立附件保留。所有平台构建成功后创建并发布 GitHub Release；带连字符的版本标签（如 `v0.2.0-rc.1`）标记为预发布，安装脚本不会选择它。手动运行工作流可下载构建产物，只有标签运行会发布 Release。
 
 发布前更新 `Cargo.toml` 的版本并更新锁文件，然后提交并推送标签，例如：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-工作流使用 GitHub 托管的原生架构 runner，参考 [GitHub runner 文档](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)；压缩工具参考 [UPX 官方文档](https://github.com/upx/upx/blob/devel/doc/upx-doc.txt)。当前不提供 Windows 原生二进制，因为接收端尚未支持 Windows。
+工作流使用 GitHub 托管的原生架构 runner，参考 [GitHub runner 文档](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)；压缩工具参考 [UPX 官方文档](https://github.com/upx/upx/blob/devel/doc/upx-doc.txt)。Windows 构建会在原生 runner 上运行 Rust 测试；Bash 安装脚本只支持 Linux/macOS。
 
 ## 默认通过中继同步
 
@@ -113,7 +114,7 @@ cayman send ./docs
 cayman receive ./received
 ```
 
-发送端添加 `--watch` 开启持续增量同步，每秒检查目录元数据，发现变化后执行增量同步：
+发送端添加 `--watch` 开启持续增量同步，通过原生文件事件发现变化，并每 60 秒完整校验兜底：
 
 ```bash
 cayman send ./docs --watch
@@ -121,6 +122,28 @@ cayman receive ./received
 ```
 
 接收端无需额外参数，自动跟随发送端的模式。首次同步与后续变化显示单行进度，完成后保留汇总；无变化轮询保持安静。持续模式可用 Ctrl+C 停止。旧的 `--once` 参数已移除。
+
+## 双向同步和删除传播
+
+默认单向、不删除。目录双向同步需要双方显式同意；不支持单文件双向同步：
+
+```bash
+cayman send ./docs --watch --bidirectional
+cayman receive ./received --bidirectional
+```
+
+此时 `docs/` 与 `received/docs/` 双向交换新增和修改。只有一端修改时传播到另一端；双方修改同一文件时保留双方内容并报告冲突，不自动选择胜者或合并文本。去掉发送端 `--watch` 则只协调一轮后退出。
+
+需要同步删除时，两端都添加 `--delete`：
+
+```bash
+cayman send ./docs --watch --bidirectional --delete
+cayman receive ./received --bidirectional --delete
+```
+
+单向同步也可使用双方 `--delete`。只删除本同步范围内曾确认同步、且未被本地修改的文件；删除前备份，未知文件保留，只清理已跟踪的空目录。删除与另一端修改冲突时保留修改。这不是对目标目录执行无条件镜像删除。双向模式会在源目录和目标目录都创建 `.cayman`，删除和双向同步的状态绑定同步范围，不能随意改用于另一对目录；普通单向传输可共用目标目录，切换来源会清空删除归属，不继承其他来源的删除权限。
+
+`--watch` 在已认证会话中遇到网络中断时自动重连。重连使用内存中的高熵凭据和新 TLS 连接，不重新尝试短码 PAKE；退避从 1 秒增长至 30 秒，每个进程最多重试 10 次。两端进程需要保持运行，重启任一端后需重新配对。已提交文件会重新比对并跳过；未完成文件重新传输缺失块，尚无持久化的分块进度恢复。认证、协议、文件系统错误不会作为普通断线无限重试。
 
 ## 显式选择直连
 
@@ -143,9 +166,9 @@ cargo run -- receive ./received-docs --connect 192.168.1.10:9009
 
 双方执行 SPAKE2 并双向确认密钥，绑定协议版本、房间号和发送/接收角色。确认成功后，通过认证加密交换本次 TLS 的证书指纹与随机认证秘密，再建立固定证书的 TLS 1.3 通道。文件内容和元数据仍通过 TLS 传输；未完成认证不会访问接收目录。具体流程见 [短码配对协议](docs/short-code-pairing.md)。
 
-每次启动生成新码，最多等待另一端 10 分钟（中继可能更早清理房间），配对握手限时 30 秒。一次启动只允许一次配对尝试；错误短码或连接中断会结束本次会话，重新运行发送端获取新码。短码不支持自选弱密码。接收时允许单词大小写和整行首尾空白。
+每次启动生成新码，最多等待另一端 10 分钟（中继可能更早清理房间），配对握手限时 30 秒。一次启动只允许一次配对尝试；错误短码或配对阶段中断会结束本次配对，重新运行发送端获取新码；成功认证后的持续会话支持自动重连。短码不支持自选弱密码。接收时允许单词大小写和整行首尾空白。
 
-**两端都需要升级。** 原先 `cayman-direct-v1:...` 长码不再作为用户输入；旧实例需重启生成短码。短码与 croc 体验类似，但两端仍须运行 Cayman，不能与官方 croc 客户端互传。自动重连和直连 NAT 穿透尚未实现。
+**两端都需要升级。** 原先 `cayman-direct-v1:...` 长码不再作为用户输入；旧实例需重启生成短码。短码与 croc 体验类似，但两端仍须运行 Cayman，不能与官方 croc 客户端互传。直连 NAT 穿透尚未实现。短码、PAKE、端到端加密是 Cayman 与 croc 共有的能力；Rust 本身不意味着协议更安全，项目尚未经过独立安全审计，详见 [安全边界](SECURITY.md)。
 
 ## 增量与可靠性
 
@@ -158,21 +181,31 @@ cargo run -- receive ./received-docs --connect 192.168.1.10:9009
 同步汇总将文件结果与数据量分开，例如：
 
 ```text
-Files: 1 updated, 4 unchanged | Conflicts: 0
+Files: 1 updated, 4 unchanged, 0 deleted | Conflicts: 0
 File data: 27875 bytes transferred, 0 bytes reused locally
 ```
 
-`updated` 包含新增或替换且已成功提交的文件，`unchanged` 表示内容相同的文件；目录不计入这两个文件计数，冲突计数可能包含目录。数据量统计已成功提交文件的原始内容字节，不是网卡流量，不包含元数据、JSON 编码、TLS 开销或未提交传输。`reused locally` 只统计更新文件时复用的本地块，不包含整个跳过的未变化文件。
+`updated` 包含新增或替换且已成功提交的文件，`unchanged` 表示内容相同的文件；`deleted` 表示本轮删除的文件；目录不计入文件计数，冲突计数可能包含目录。数据量统计已成功提交文件的原始内容字节，不是网卡流量，不包含元数据、JSON 编码、TLS 开销或未提交传输。`reused locally` 只统计更新文件时复用的本地块，不包含整个跳过的未变化文件。
 
 比对发生在发送文件内容之前：发送端在本地读取源文件，先发送路径、大小和整文件 SHA-256，只有接收端需要更新时再发送每个 256 KiB 块的 SHA-256；接收端在本地计算已有文件摘要，相同则跳过，不同且允许更新时请求缺失块。本地匹配块可在同一个目标文件的其他块位置复用。接收端重建临时文件，校验整文件后原子提交。
 
-摘要采用有容量上限的会话内缓存，以大小、修改时间以及 Unix 设备号、inode、ctime 判断是否可复用。`--watch` 每秒轮询目录元数据；源端无变化时只交换心跳，不重复发送文件清单或读取内容。每 60 秒清空两端缓存并执行完整校验，补偿元数据检测遗漏并检查接收端变化。源端变化时仍发送一轮完整的轻量文件摘要，批量清单和原生文件系统事件监听尚未实现。首次遇到相同文件无需传输块摘要或文件内容。缓存不跨进程持久化；最终提交前仍重新读取并核对目标，避免缓存削弱本地修改冲突保护。
+摘要采用有容量上限的会话内缓存，以大小、修改时间以及 Unix 设备号、inode、ctime 判断是否可复用。原生监听使用 Linux inotify、macOS kqueue、Windows 目录变更通知；每秒处理变化提示，无事件时只交换心跳。每 60 秒清空两端缓存并完整校验，补偿事件遗漏和元数据未变化的内容修改。监听资源不足时退回每秒元数据轮询；macOS 监听需要为文件持有描述符，大目录可能触发此回退。变化后仍交换完整的文件摘要清单，没有目录 Merkle 索引。
 
-摘要目前仍使用 JSON 编码并逐文件交互。小于 256 KiB 的文件只有一个块，改动一个字节也要重传整个文件内容；大文件中部插入数据可能使后续固定块边界错位。此次文件同步握手已升级为 `cayman-sync/2`，两端需同时更新，旧版本会拒绝连接。
+块摘要和缺失块请求以最多 1,024 项分页，避免单个大文件的块清单超出帧上限。摘要和数据帧仍为 JSON，文件清单逐条交互；小于 256 KiB 的文件修改一个字节也需重传整个文件内容，大文件中部插入可能使后续固定块边界错位。尚无 CDC、二进制数据帧、压缩和并行传输，也没有充分的性能基准来宣称比 croc 更快。
 
-当前实现是目录元数据轮询的单向同步：不传播删除，不保留权限、时间戳等元数据，不实现双向合并、原生文件事件监控或持久化块级断点续传。新文件使用临时文件的私有权限。目标目录应由可信本机用户管理；当前路径检查不能防御恶意本机进程并发替换目录。
+接收端实现支持 Linux、macOS 和 Windows。Windows 拒绝重解析点（包括 junction），使用文件锁及临时文件替换，但没有 Unix 目录 fsync 的同等掉电持久性保证；占用文件、杀毒软件或权限限制可能令替换失败。不会保留权限、时间戳、ACL 等元数据，不支持符号链接和特殊文件；目标目录必须由可信本机用户管理，路径检查不能防御恶意本机进程并发替换目录。
 
-接收端目前支持 Unix（macOS/Linux）。原型限制：每轮最多 10,000 个条目、单文件最多 1 GiB，接收端 `--max-bytes` 默认为每轮声明文件总大小 10 GiB。这不是累计磁盘配额；历史备份尚无自动清理策略。JSON 数据帧存在编码开销，尚未实现二进制块编码、CDC、压缩、索引缓存和并行传输。源文件在传输中变化时可能终止本次会话；断线后需重启发送端并使用新码连接。
+默认资源上限已从单文件 1 GiB / 每轮 10,000 条提升为：
+
+| 参数 | 默认 / 上限 | 含义 |
+| --- | --- | --- |
+| `--max-file-bytes` | 256 GiB，协议上限 | 单文件字节数，可调低 |
+| `--max-files` | 100,000，协议上限 | 每轮文件与目录条目总数，可调低 |
+| `--max-bytes` | 1 TiB，可配置 | 每轮声明文件大小之和 |
+
+两端均可设置限制，双向时分别约束本地发送和接收。分页限制了单帧大小，但文件摘要仍占用内存，状态文件会整体重写，十万级目录和 256 GiB 文件并未做完整规模压测。配额不是累计磁盘限制；历史备份尚无自动清理。源文件在传输期间变化可能使本次会话失败，使用稳定文件或文件系统快照更合适。
+
+v0.2 使用 `cayman-session/3` 会话协议，双方必须同时升级。状态格式从 1 迁移为 2；升级后不要用旧程序打开新状态目录。旧状态首次绑定范围时只把重新验证过的文件纳入可删除集合，旧布局下的 `.cayman` 不会自动跨目录搬迁。不要删除 `.cayman` 来解决冲突，否则会丢失共同基线和历史。
 
 ## 验证
 
@@ -183,13 +216,14 @@ cargo test --offline
 # vendored SPAKE2 的上游向量及文档测试：
 cargo test --offline --manifest-path vendor/spake2/Cargo.toml --features std
 # 在允许监听回环 TCP 端口的终端另行运行：
+cargo test --offline --lib watch_reconnects_after_transport_is_cut -- --ignored
 cargo test --offline --test remote_cli -- --ignored
 ```
 
-默认测试包含短码生成/解析、SPAKE2 错码和房间绑定、握手篡改拒绝、Go 独立算术参考向量、模拟中继接入/心跳/拒绝响应，以及内存双工流上的真实 TLS 握手、证书固定、秘密认证、远程传输、持续增量更新、冲突保护与状态恢复。三个真实 TCP 测试需要显式运行，其中 Go 中继测试需 PATH 中有 croc v11.5.3；当前开发沙箱禁止监听端口，尚未在此环境通过这些测试。内存测试不能替代跨机器实测。
+默认测试还覆盖双向单边修改与冲突、删除授权和备份、原生文件事件、重连凭据认证、超过 1 GiB 文件的分页握手（不是完整大文件传输压测）。默认测试包含短码生成/解析、SPAKE2 错码和房间绑定、握手篡改拒绝、Go 独立算术参考向量、模拟中继接入/心跳/拒绝响应，以及内存双工流上的真实 TLS 握手、证书固定、秘密认证、远程传输、持续增量更新、冲突保护与状态恢复。另外三个进程级真实 TCP 测试需要显式运行，其中 Go 中继测试需 PATH 中有 croc v11.5.3；当前开发沙箱禁止监听端口，尚未在此环境通过这些测试。内存测试不能替代跨机器实测。
 
 `--offline` 需要依赖缓存；首次联网构建可去掉它。SPAKE2 0.4.0 源码已随项目纳入，来源及适配记录见 [VENDOR.md](vendor/spake2/VENDOR.md)。HKDF/HMAC/AES-GCM 记录模块现在用于 SPAKE2 密钥确认和 TLS 凭据的认证加密；文件数据通道仍使用 rustls TLS。
 
-后续路线与设计：[基础实施方案](docs/implementation-plan.md)、[性能与同步](docs/performance-reliability-sync.md)、[p2sync 评估](docs/p2sync-review.md)。
+以下为早期设计资料，当前已实现功能和限制以本 README 为准：[基础实施方案](docs/implementation-plan.md)、[性能与同步](docs/performance-reliability-sync.md)、[p2sync 评估](docs/p2sync-review.md)。
 
 终端进度每秒最多刷新 10 次：总体百分比按本轮已处理条目数计算（含目录和未变化文件），当前文件百分比按需传输的字节数计算，不包含复用块。首次同步显示 Initial sync，后续变化显示 Incremental sync；无变化轮询保持安静。输出重定向时仅保留汇总，不写入进度控制字符。

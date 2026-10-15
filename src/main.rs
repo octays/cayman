@@ -11,20 +11,25 @@ async fn run() -> Result<ExitCode, cayman::crypto::direct::Error> {
             listen,
             relay,
             watch,
+            delete,
+            bidirectional,
+            limits,
             code_file,
         } => {
-            if let Some(listen) = listen {
-                cayman::sync::remote::send(&source, listen, !watch, code_file.as_deref()).await?;
-            } else {
-                cayman::sync::remote::send_relay(
-                    &source,
-                    relay.address(),
-                    &relay.password()?,
-                    !watch,
-                    code_file.as_deref(),
-                )
-                .await?;
-            }
+            cayman::sync::session::send(
+                &source,
+                listen,
+                relay.address(),
+                &relay.password()?,
+                cayman::sync::session::SendOptions {
+                    watch,
+                    delete,
+                    bidirectional,
+                    limits: limits.into(),
+                },
+                code_file.as_deref(),
+            )
+            .await?;
         }
         Command::Receive {
             output,
@@ -32,7 +37,9 @@ async fn run() -> Result<ExitCode, cayman::crypto::direct::Error> {
             relay,
             code_file,
             replace_existing,
-            max_bytes,
+            delete,
+            bidirectional,
+            limits,
         } => {
             use std::io::{BufRead, Read};
             let mut code = zeroize::Zeroizing::new(String::new());
@@ -44,20 +51,20 @@ async fn run() -> Result<ExitCode, cayman::crypto::direct::Error> {
                 eprintln!("Paste the sender's pairing code:");
                 io::stdin().lock().take(256).read_line(&mut code)?;
             }
-            if let Some(connect) = connect {
-                cayman::sync::remote::receive(&output, connect, &code, replace_existing, max_bytes)
-                    .await?;
-            } else {
-                cayman::sync::remote::receive_relay(
-                    &output,
-                    relay.address(),
-                    &relay.password()?,
-                    &code,
+            cayman::sync::session::receive(
+                &output,
+                connect,
+                relay.address(),
+                &relay.password()?,
+                &code,
+                cayman::sync::session::ReceiveOptions {
+                    allow_delete: delete,
+                    bidirectional,
                     replace_existing,
-                    max_bytes,
-                )
-                .await?;
-            }
+                    limits: limits.into(),
+                },
+            )
+            .await?;
         }
     }
     Ok(ExitCode::SUCCESS)

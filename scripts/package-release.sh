@@ -3,15 +3,17 @@ set -euo pipefail
 if [[ $# != 2 ]]; then echo "Usage: $0 RUST_TARGET PLATFORM" >&2; exit 2; fi
 target=$1
 platform=$2
-case "$platform" in linux-amd64|linux-arm64|darwin-amd64|darwin-arm64) ;; *) exit 2 ;; esac
+case "$platform" in linux-amd64|linux-arm64|darwin-amd64|darwin-arm64|windows-amd64) ;; *) exit 2 ;; esac
 name="cayman-$platform"
+exe=''
+if [[ "$platform" == windows-* ]]; then exe='.exe'; name="$name$exe"; fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p dist
-cp "target/$target/release/cayman" "$work/original"
+cp "target/$target/release/cayman$exe" "$work/original"
 binary="$work/$name"
 cp "$work/original" "$binary"
-if [[ "$platform" == linux-* ]]; then
+if [[ "$platform" == linux-* || "$platform" == windows-* ]]; then
   upx --best --lzma "$binary"
   upx -t "$binary"
   "$binary" --version

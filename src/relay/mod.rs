@@ -25,7 +25,12 @@ pub async fn connect(address: &str, password: &str, room: &str) -> Result<TcpStr
         Ok(tcp)
     })
     .await
-    .map_err(|_| "relay connection/admission timed out")?
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "relay connection/admission timed out",
+        )
+    })?
 }
 
 // Exact reads are important: room confirmation and the peer's first frame can
@@ -134,10 +139,15 @@ pub async fn pair<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) -> Result<S,
         }
     })
     .await
-    .map_err(|_| "timed out waiting for relay peer")?
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out waiting for relay peer",
+        )
+    })?
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn test_admit<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     room: &str,

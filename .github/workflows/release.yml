@@ -26,6 +26,9 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             platform: darwin-arm64
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows-amd64
     runs-on: ${{ matrix.os }}
     env:
       TARGET: ${{ matrix.target }}
@@ -45,6 +48,8 @@ jobs:
             target_key=${TARGET//-/_}
             echo "CC_${target_key}=musl-gcc" >> "$GITHUB_ENV"
             echo "CARGO_TARGET_${target_key^^}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          elif [[ "$RUNNER_OS" == Windows ]]; then
+            choco install upx -y --no-progress
           else
             brew install upx
           fi
@@ -52,10 +57,14 @@ jobs:
         shell: bash
         run: |
           bash -n scripts/install.sh scripts/package-release.sh
-          python3 scripts/test-install.py
+          if [[ "$RUNNER_OS" != Windows ]]; then python3 scripts/test-install.py; fi
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+          cargo test --locked --lib watch_reconnects_after_transport_is_cut -- --ignored
+          if [[ "$RUNNER_OS" != Windows ]]; then
+            cargo test --locked --test remote_cli -- --ignored --skip actual_go_croc_relay_transfers_and_rejects_wrong_password
+          fi
           cargo build --locked --release --target "$TARGET"
       - name: Compress and package
         shell: bash
