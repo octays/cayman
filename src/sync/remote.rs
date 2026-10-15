@@ -97,8 +97,12 @@ fn source_layout(source: &Path) -> Result<(PathBuf, PathBuf), Error> {
     let contents = raw.ends_with(std::path::is_separator)
         || raw.rsplit(std::path::is_separator).next() == Some(".");
     let lexical: PathBuf = source.components().collect();
-    if !std::fs::symlink_metadata(&lexical)?.is_dir() {
-        return Err("source must be a real directory".into());
+    let metadata = std::fs::symlink_metadata(&lexical)?;
+    if !metadata.is_dir() && !metadata.is_file() {
+        return Err("source must be a regular file or a real directory".into());
+    }
+    if metadata.is_file() && contents {
+        return Err("a file source cannot end with / or /.".into());
     }
     let root = std::fs::canonicalize(&lexical)?;
     let prefix = if contents {
@@ -316,16 +320,21 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
     interval: Duration,
 ) -> Result<(), Error> {
     let (source, prefix) = source_layout(source)?;
+    let single_file = std::fs::symlink_metadata(&source)?.is_file();
     let mut log = RoundLog::default();
     let mut cache = super::cache::ManifestCache::default();
     let mut rechecked = Instant::now();
     loop {
-        let snapshot = source_snapshot(&source)?;
-        let mut entries: Vec<_> = inventory(&source)?
-            .into_iter()
-            .filter(|(p, _)| !p.starts_with(".cayman"))
-            .collect();
-        if !prefix.as_os_str().is_empty() {
+        let snapshot = source_snapshot(&source, single_file)?;
+        let mut entries: Vec<_> = if single_file {
+            vec![(PathBuf::new(), Kind::File)]
+        } else {
+            inventory(&source)?
+                .into_iter()
+                .filter(|(p, _)| !p.starts_with(".cayman"))
+                .collect()
+        };
+        if !single_file && !prefix.as_os_str().is_empty() {
             entries.insert(0, (PathBuf::new(), Kind::Directory));
         }
         if entries.len() > MAX_FILES {
@@ -350,7 +359,11 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
                 .replace(std::path::MAIN_SEPARATOR, "/");
             super::receiver::validate_path(&path)?;
             let directory = kind == Kind::Directory;
-            let full = source.join(&relative);
+            let full = if relative.as_os_str().is_empty() {
+                source.clone()
+            } else {
+                source.join(&relative)
+            };
             let offer = if directory {
                 Offer {
                     path,
@@ -454,7 +467,7 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
                 rechecked = Instant::now();
                 break;
             }
-            if !same_snapshot(&snapshot, &source_snapshot(&source)?) {
+            if !same_snapshot(&snapshot, &source_snapshot(&source, single_file)?) {
                 break;
             }
             write(io, &Message::Ping).await?;
@@ -465,7 +478,17 @@ pub(super) async fn sender_session<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-fn source_snapshot(root: &Path) -> Result<BTreeMap<PathBuf, std::fs::Metadata>, Error> {
+fn source_snapshot(
+    root: &Path,
+    single_file: bool,
+) -> Result<BTreeMap<PathBuf, std::fs::Metadata>, Error> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if single_file {
+        if !metadata.is_file() {
+            return Err("source file was replaced by a directory or special file".into());
+        }
+        return Ok(BTreeMap::from([(PathBuf::new(), metadata)]));
+    }
     let entries = inventory(root)?;
     if entries.len() > MAX_FILES {
         return Err("too many source entries".into());
@@ -568,6 +591,39 @@ pub(super) async fn receiver_session<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn single_file_transfer_reuses_blocks_and_excludes_siblings() {
+        let source = tempdir().unwrap();
+        let output = tempdir().unwrap();
+        let file = source.path().join("upgrade-go.sh");
+        let mut data = vec![9; CHUNK + 17];
+        std::fs::write(&file, &data).unwrap();
+        std::fs::write(source.path().join("private"), b"not shared").unwrap();
+        let normalized = normalized_source(&file).unwrap();
+        for turn in 0..3 {
+            if turn == 1 {
+                data[CHUNK + 3] ^= 1;
+                std::fs::write(&file, &data).unwrap();
+            }
+            let (sent, received) = round(&normalized, output.path(), false, MAX_FILE).await;
+            sent.unwrap();
+            received.unwrap();
+            assert_eq!(
+                std::fs::read(output.path().join("upgrade-go.sh")).unwrap(),
+                data
+            );
+            assert!(!output.path().join("private").exists());
+        }
+        assert!(source_layout(&file.join("")).is_err());
+        assert!(source_layout(&file.join(".")).is_err());
+        let link = source.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(source_layout(&link).is_err());
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(source_snapshot(&file, true).is_err());
+    }
 
     #[tokio::test]
     async fn unchanged_files_send_only_summary_not_block_lists() {
@@ -806,20 +862,28 @@ mod tests {
 
     #[tokio::test]
     async fn continuous_session_reuses_unchanged_blocks() {
+        continuous_source(false).await;
+    }
+
+    #[tokio::test]
+    async fn continuous_single_file_reuses_unchanged_blocks() {
+        continuous_source(true).await;
+    }
+
+    async fn continuous_source(single_file: bool) {
         let source = tempdir().unwrap();
         let output = tempdir().unwrap();
         let mut data = [vec![1; CHUNK], vec![2; CHUNK], vec![3; CHUNK]].concat();
         std::fs::write(source.path().join("file"), &data).unwrap();
+        let source_arg = if single_file {
+            source.path().join("file")
+        } else {
+            source.path().join(".")
+        };
         let (a, b) = tokio::io::duplex(4096);
         let sender = async {
             let mut io = Framed::new(a, MAX_RECORD, Duration::from_secs(3)).unwrap();
-            sender_session(
-                &source.path().join("."),
-                &mut io,
-                false,
-                Duration::from_millis(10),
-            )
-            .await
+            sender_session(&source_arg, &mut io, false, Duration::from_millis(10)).await
         };
         let receiver = async {
             let mut io = Framed::new(b, MAX_RECORD, Duration::from_secs(3)).unwrap();

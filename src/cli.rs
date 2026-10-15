@@ -15,10 +15,10 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Share a source directory through a relay and display a one-time invitation.
+    /// Share a file or directory through a relay and display a one-time invitation.
     #[command(visible_alias = "s")]
     Send {
-        /// DIR includes its name; DIR/ or DIR/. sends only its contents.
+        /// FILE sends one file; DIR includes its name; DIR/ or DIR/. sends its contents.
         source: PathBuf,
         /// Explicit direct mode: listen on this IP:port instead of using a relay.
         #[arg(long, conflicts_with_all = ["relay", "relay_password_file"])]

@@ -1,6 +1,6 @@
 # Cayman
 
-Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接，使用 SPAKE2 短码配对和端到端 TLS。发送端只选择源目录，接收端决定目标目录；不提供 local-sync。
+Rust 跨机器增量同步工具，开发中。默认通过 Go croc 中继连接，使用 SPAKE2 短码配对和端到端 TLS。发送端只选择源文件或目录，接收端决定目标目录；不提供 local-sync。
 
 命令支持短别名：`s` 等同于 `send`，`r` 等同于 `receive`。例如 `cayman s ./docs`、`cayman r .`。
 
@@ -64,6 +64,16 @@ git push origin v0.1.0
 ```bash
 cargo run -- send ./docs
 ```
+
+发送单个文件：
+
+```bash
+cayman send upgrade-go.sh
+# 接收端保存为 ./received/upgrade-go.sh
+cayman receive ./received
+```
+
+单文件同样支持 `--watch` 持续增量更新，只共享指定文件，不扫描或发送同目录的其他文件。文件源不能带末尾 `/`；符号链接与特殊文件不支持。接收端参数始终是目标目录，文件使用原文件名。当前不保留执行权限等元数据，脚本接收后可通过 `bash upgrade-go.sh` 执行。
 
 源路径末尾决定接收端的目录布局（假设接收端运行 `cayman receive ./received`）：
 
